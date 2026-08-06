@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FLIPR: Flip Profit Tracker
 // @namespace    http://torn.city.com.dot.com.com
-// @version      2.4.1
+// @version      2.4.2
 // @description  Automatically logs what you paid for bazaar/item market purchases (via your own Torn API key) and warns you before you list them for less than a real profit, accounting for Torn's item market sales tax
 // @author       The_Baron [1467784]
 // @match        https://www.torn.com/*
@@ -38,12 +38,20 @@
 (() => {
   'use strict';
 
+  // Torn PDA re-injects userscripts on every in-app navigation instead of doing a
+  // real page reload, so the whole IIFE runs again and would append a second
+  // #flipr-panel (and a second set of observers/pollers) each time - the buttons
+  // that "stack indefinitely" under the original until a hard refresh. If our panel
+  // is already in the DOM, this is a re-injection: bail out and leave the live
+  // instance untouched. A full refresh clears the DOM, so the first run always wins.
+  if (document.getElementById('flipr-panel')) return;
+
   ////////////////////////////////////////////////////////////////////////////
   ////  CONFIG / CONSTANTS
   ////////////////////////////////////////////////////////////////////////////
 
   const DEBUG = false;
-  const SCRIPT_VERSION = '2.4.1';
+  const SCRIPT_VERSION = '2.4.2';
 
   const STORAGE_KEY = 'flipr_lots_v1';
   const SETTINGS_KEY = 'flipr_settings_v1';

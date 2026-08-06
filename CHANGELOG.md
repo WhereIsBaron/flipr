@@ -4,6 +4,9 @@ Patch notes for FLIPR, a bazaar-flip profit tracker userscript for Torn. Created
 
 ---
 
+## v2.4.2
+- **Fix (PDA):** on Torn PDA, extra "F" buttons could stack up under the original as you moved around the game - one more each time you navigated (Crimes → Pick Pocket → back to hub → Burglary, and so on), only clearing on a full page refresh. PDA re-runs userscripts on each in-app navigation instead of doing a real page reload, so FLIPR was building a fresh panel on top of the live one every time. FLIPR now detects that its panel is already present and leaves it alone. Thanks to Skid_Br0 for the clear repro (Redmi K70, PDA 3.14.3).
+
 ## v2.4.1
 - **Small:** **A "Make a FLIPR-only key" link** now sits next to the API key box. It opens Torn's Custom Key Builder with only the two things FLIPR reads already ticked: your own activity log, and the public item-name list. A key scoped that way cannot read your money, battle stats, messages or faction data, so a leak costs you far less than a Full key would. A Full key still works if you already use one.
 
