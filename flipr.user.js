@@ -1,8 +1,10 @@
 // ==UserScript==
 // @name         FLIPR: Flip Profit Tracker
 // @namespace    http://torn.city.com.dot.com.com
-// @version      2.4.2
+// @version      2.43.0
 // @description  Automatically logs what you paid for bazaar/item market purchases (via your own Torn API key) and warns you before you list them for less than a real profit, accounting for Torn's item market sales tax
+// @updateURL    https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
+// @downloadURL  https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
 // @author       The_Baron [1467784]
 // @match        https://www.torn.com/*
 // @run-at       document-end
@@ -10,6 +12,7 @@
 // @grant        GM_getValue
 // @grant        GM_deleteValue
 // @grant        GM_addValueChangeListener
+// @grant        unsafeWindow
 // @connect      api.torn.com
 // @license      MIT
 // ==/UserScript==
@@ -38,20 +41,12 @@
 (() => {
   'use strict';
 
-  // Torn PDA re-injects userscripts on every in-app navigation instead of doing a
-  // real page reload, so the whole IIFE runs again and would append a second
-  // #flipr-panel (and a second set of observers/pollers) each time - the buttons
-  // that "stack indefinitely" under the original until a hard refresh. If our panel
-  // is already in the DOM, this is a re-injection: bail out and leave the live
-  // instance untouched. A full refresh clears the DOM, so the first run always wins.
-  if (document.getElementById('flipr-panel')) return;
-
   ////////////////////////////////////////////////////////////////////////////
   ////  CONFIG / CONSTANTS
   ////////////////////////////////////////////////////////////////////////////
 
   const DEBUG = false;
-  const SCRIPT_VERSION = '2.4.2';
+  const SCRIPT_VERSION = '2.42.0';
 
   const STORAGE_KEY = 'flipr_lots_v1';
   const SETTINGS_KEY = 'flipr_settings_v1';
@@ -64,6 +59,7 @@
   // reconciliation tickets - both persisted so a purchase can never be stored twice
   // across reloads, overlapping polls, or multiple open tabs.
   const PROCESSED_LOG_IDS_KEY = 'flipr_processed_log_ids_v1';
+  const PROCESSED_TRADES_KEY = 'flipr_processed_trades_v1';
   const PENDING_TICKETS_KEY = 'flipr_pending_tickets_v2';
   // Realized-profit ledger (see the SALES TRACKER section). Forward-only from the
   // build that introduced it: a detected sale is matched FIFO against open lots at
@@ -194,6 +190,14 @@
     return v && typeof v.top === 'number' && typeof v.left === 'number' ? { top: v.top, left: v.left } : null;
   }
 
+  // A saved manual panel size (see PANEL RESIZE). Both numbers must be finite or
+  // it falls back to the default sizing; the values are re-clamped to the screen
+  // when applied, so a size saved on a big monitor still fits a phone.
+  function readPanelSize(v) {
+    return v && Number.isFinite(Number(v.width)) && Number.isFinite(Number(v.bodyHeight))
+      ? { width: Number(v.width), bodyHeight: Number(v.bodyHeight) } : null;
+  }
+
   function loadSettings() {
     try {
       const raw = Store.get(SETTINGS_KEY, '{}');
@@ -206,6 +210,26 @@
         // Show the after-5%-tax price when a listing is clicked on the Item
         // Market (see the MARKET TAX HELPER section). On by default.
         marketTaxHelper: typeof parsed.marketTaxHelper === 'boolean' ? parsed.marketTaxHelper : true,
+        // Draw the quality/bonus overlay on Item Market + Bazaar weapon/armour
+        // listings (see the MARKET QUALITY OVERLAY section). On by default.
+        marketQuality: typeof parsed.marketQuality === 'boolean' ? parsed.marketQuality : true,
+        // Record completed player trades (trade.php) as buys/sales (see the PLAYER
+        // TRADE LOG section). On by default.
+        trackTrades: typeof parsed.trackTrades === 'boolean' ? parsed.trackTrades : true,
+        // How the launcher is shown. 'float' is the classic draggable button
+        // that collapses to a round puck you can park anywhere. 'docked' hides
+        // that puck and instead wedges an open/close button into Torn's bottom
+        // bar next to Notes/People, which is a fixed, easy-to-hit target on the
+        // PDA (asked for by -IBY- [3603459]). Default stays 'float' so no
+        // existing install changes on its own. See DOCKED LAUNCHER.
+        launcherMode: parsed.launcherMode === 'docked' ? 'docked' : 'float',
+        // Where the docked button sits among the other buttons in Torn's bottom
+        // bar, as a 0-based index you set by dragging it (see DOCKED LAUNCHER).
+        // null means "not placed yet" - added at the end. Best-effort: it is an
+        // index, so another script adding a bar button can nudge it, but Torn's
+        // own Notes/People anchors are stable enough that it lands back where you
+        // left it. Clamped on re-insert, so a shorter bar just puts it last.
+        dockIndex: (Number.isInteger(parsed.dockIndex) && parsed.dockIndex >= 0) ? parsed.dockIndex : null,
         // Every page load re-runs this script from scratch (a fresh tab has
         // no memory of what was open before), so which panel tab was last
         // active has to be persisted here the same way collapsed/feeMode
@@ -217,9 +241,12 @@
         // "never dragged in that state, use the default fixed top-right spot".
         panelPos: readPanelPos(parsed.panelPos),
         collapsedPos: readPanelPos(parsed.collapsedPos),
+        // How wide the panel and how tall its scrolling body were last set to by
+        // dragging the resize grip (see PANEL RESIZE). null = default sizing.
+        panelSize: readPanelSize(parsed.panelSize),
       };
     } catch (e) {
-      return { feeMode: 'bazaar', collapsed: false, scanPageText: true, holdingsMode: 'separate', marketTaxHelper: true, activeTab: 'main', panelPos: null, collapsedPos: null };
+      return { feeMode: 'bazaar', collapsed: false, scanPageText: true, holdingsMode: 'separate', marketTaxHelper: true, marketQuality: true, trackTrades: true, launcherMode: 'float', dockIndex: null, activeTab: 'main', panelPos: null, collapsedPos: null, panelSize: null };
     }
   }
 
@@ -498,15 +525,21 @@
       const incoming = loadSettings();
       let changed = false;
       let holdingsModeChanged = false;
-      for (const k of ['feeMode', 'holdingsMode', 'scanPageText', 'marketTaxHelper']) {
+      let launcherModeChanged = false;
+      let marketQualityChanged = false;
+      for (const k of ['feeMode', 'holdingsMode', 'scanPageText', 'marketTaxHelper', 'marketQuality', 'trackTrades', 'launcherMode']) {
         if (settings[k] !== incoming[k]) {
           if (k === 'holdingsMode') holdingsModeChanged = true;
+          if (k === 'launcherMode') launcherModeChanged = true;
+          if (k === 'marketQuality') marketQualityChanged = true;
           settings[k] = incoming[k];
           changed = true;
         }
       }
       if (!changed) return;
       if (holdingsModeChanged) unbindPriceInput(); // the bound entry's id no longer matches the new mode
+      if (launcherModeChanged) applyLauncherMode(); // stand up / tear down the bottom-bar button to match
+      if (marketQualityChanged) applyMarketQuality(); // draw or clear the market overlay to match
       syncSettingsControls();
       renderAll();
     });
@@ -736,6 +769,44 @@
     return true;
   }
 
+  // Correcting a COUNT by hand - e.g. you sold some and the sale wasn't caught, so the
+  // row still shows the old number. The per-unit price you paid is kept untouched, so
+  // every total (position value, whole-lot profit, Sell Check) simply falls out of the
+  // new count - editing 10 down to 5 halves the money the row represents. In "separate"
+  // mode a row is one purchase, so this sets that lot's count directly (0 removes it).
+  // In "lump" mode the row is several lots blended into one average, so a SMALLER number
+  // is applied oldest-first (FIFO) - exactly as an untracked sale would consume them -
+  // and a number the same or larger is refused (there is no honest single lot to add
+  // phantom units to). Returns true if anything changed.
+  function setEntryQty(id, newQty) {
+    newQty = Math.floor(Number(newQty));
+    if (!Number.isFinite(newQty) || newQty < 0) return false;
+    if (String(id).startsWith(LUMP_ID_PREFIX)) {
+      const key = id.slice(LUMP_ID_PREFIX.length);
+      const group = lots
+        .filter((l) => normalize(l.itemName) + ' ' + (l.statsKey ?? '') === key && l.qty > 0)
+        .sort((a, b) => a.ts - b.ts); // FIFO
+      const total = group.reduce((s, l) => s + l.qty, 0);
+      if (newQty >= total) return false; // a blended row can only be corrected DOWN
+      let toRemove = total - newQty;
+      for (const l of group) {
+        if (toRemove <= 0) break;
+        const take = Math.min(l.qty, toRemove);
+        l.qty -= take;
+        toRemove -= take;
+      }
+      lots = lots.filter((l) => l.qty > 0);
+      saveLots(lots);
+      return true;
+    }
+    const lot = findLotById(id);
+    if (!lot) return false;
+    if (newQty <= 0) { removeLot(id); return true; }
+    lot.qty = newQty;
+    saveLots(lots);
+    return true;
+  }
+
   // Swaps a Holdings row's price text for an input. Enter or clicking away saves,
   // Escape cancels. Commit-on-blur is deliberate: the common case is typing a number and
   // clicking back onto the page, and losing that silently would be worse than the rare
@@ -757,6 +828,43 @@
         // Tolerate whatever gets pasted in: "$4,517,899" and "4517899" both work.
         const v = Number(String(input.value).replace(/[^0-9.]/g, ''));
         if (Number.isFinite(v) && v >= 0) setEntryUnitCost(entry.id, v);
+      }
+      renderAll();
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+      else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    });
+    input.addEventListener('blur', () => finish(true));
+  }
+
+  // Same inline-edit dance as startPriceEdit, but for the COUNT - swap the "×N"
+  // for a small number box so an untracked sale can be corrected by hand (bought 10,
+  // quietly sold 5, type 5). The per-unit price is left alone, so the row's money just
+  // follows the new count. A blended ("lump") row can only be corrected DOWNward and
+  // setEntryQty refuses anything else; that refusal is surfaced as a toast so the edit
+  // doesn't look like it silently did nothing.
+  function startQtyEdit(qtySpan, entry) {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'flipr-price-edit';
+    input.style.width = '3.5em';
+    input.value = String(entry.qty);
+    input.title = 'Enter to save, Escape to cancel';
+    qtySpan.replaceWith(input);
+    input.focus();
+    input.select();
+    let done = false;
+    const finish = (commit) => {
+      if (done) return;
+      done = true;
+      if (commit) {
+        const v = Math.floor(Number(String(input.value).replace(/[^0-9]/g, '')));
+        if (Number.isFinite(v) && v >= 0 && v !== entry.qty) {
+          if (!setEntryQty(entry.id, v) && entry.isLump) {
+            showToast(`Enter a number below ${entry.qty} - a blended row can only be corrected down.`);
+          }
+        }
       }
       renderAll();
     };
@@ -1104,13 +1212,28 @@
     #flipr-panel { position: fixed; top: 0; right: 10px; width: 300px;
       background: #2b2b2b; color: #ccc; border: 1px solid #111;
       border-radius: 8px; font-size: 12px; line-height: 1.4; z-index: 999999;
-      box-shadow: 0 8px 28px rgba(0,0,0,0.7); }
+      box-shadow: 0 8px 28px rgba(0,0,0,0.7);
+      /* border-box so a manual resize width read from getBoundingClientRect
+         round-trips through inline style.width without drifting by the border. */
+      box-sizing: border-box; }
     #flipr-panel.flipr-collapsed .flipr-body { display: none; }
     /* Collapsed = a small round draggable button instead of the full-width
        bar, so it can sit out of the way anywhere on screen (still the same
        #flipr-header element/handlers either way - see the drag-to-move
        section in the script for why). */
-    #flipr-panel.flipr-collapsed { width: 44px; height: 44px; border-radius: 50%; overflow: hidden; }
+    /* !important so a manual resize width set inline on the panel (see PANEL
+       RESIZE) can never stop the collapsed puck from shrinking back to 44px. */
+    #flipr-panel.flipr-collapsed { width: 44px !important; height: 44px !important; border-radius: 50%; overflow: hidden; }
+    /* Manual resize grip (bottom-right corner). Pointer-driven, not CSS resize,
+       so it behaves the same on the PDA as on desktop (see makePanelResizable).
+       The width is set on the panel and the scroll height on .flipr-body; both
+       persist in settings.panelSize. Hidden while collapsed - a puck has nothing
+       to resize. The stripes are just a diagonal grip hint. */
+    #flipr-resize { position: absolute; right: 3px; bottom: 3px; width: 15px; height: 15px;
+      cursor: nwse-resize; z-index: 3; opacity: 0.45; touch-action: none;
+      background: linear-gradient(135deg, transparent 0 45%, #4da3ff 45% 55%, transparent 55% 68%, #4da3ff 68% 78%, transparent 78%); }
+    #flipr-resize:hover { opacity: 0.85; }
+    #flipr-panel.flipr-collapsed #flipr-resize { display: none; }
     #flipr-header { display: flex; justify-content: space-between; align-items: center;
       padding: 8px 10px; background: #1f1f1f; border-radius: 8px 8px 0 0; cursor: grab;
       user-select: none; touch-action: none; }
@@ -1124,6 +1247,28 @@
     .flipr-header-mini { display: none; color: #4da3ff; font-weight: bold; font-size: 16px; }
     #flipr-panel.flipr-collapsed .flipr-header-full { display: none; }
     #flipr-panel.flipr-collapsed .flipr-header-mini { display: inline; }
+    /* Docked launcher (settings.launcherMode === 'docked', see DOCKED LAUNCHER).
+       In this mode "closed" means the whole panel is hidden and reopened from a
+       button in Torn's bottom bar, instead of shrinking to a floating round
+       puck. Two classes beat the single-class .flipr-collapsed rule above, so
+       display:none wins over the 44px circle. The expanded panel is unchanged. */
+    #flipr-panel.flipr-docked.flipr-collapsed { display: none; }
+    /* The button dropped into Torn's bottom bar. It borrows the Notes/People
+       button's own class list (see ensureDockButton) so it lands in the bar's
+       slot and takes taps the same way they do; these rules restyle it into a
+       filled blue "F" tile - FLIPR's own Flip-tab blue and white - so it reads
+       as a real bar icon alongside the others rather than bare text. Its box is
+       sized in JS to sit level with the neighbouring icons. An #id selector beats
+       Torn's single-class rules, so our colours win even over the borrowed class. */
+    #flipr-dock-btn { display: inline-flex; align-items: center; justify-content: center;
+      box-sizing: border-box; width: 24px; height: 24px; padding: 0; border-radius: 4px;
+      background: #2f6fbf; color: #fff; border: 1px solid #1d477e; box-shadow: none;
+      font-weight: bold; font-size: 14px; line-height: 1; text-indent: 0;
+      cursor: pointer; user-select: none; touch-action: none; vertical-align: middle; }
+    /* touch-action: none so a touch-drag to reorder moves the button instead of
+       the webview grabbing the gesture to scroll. A plain tap still opens it. */
+    #flipr-dock-btn:hover { background: #3a80d6; color: #fff; }
+    #flipr-dock-btn.flipr-dock-dragging { opacity: 0.55; cursor: grabbing; }
     #flipr-status-line { margin-bottom: 10px; color: #6fa8dc; font-size: 10px; }
     #flipr-status-line:empty { display: none; }
     #flipr-status-line.flipr-status-warn { color: #e5534b; }
@@ -1297,6 +1442,27 @@
             After-tax price on Item Market click
           </label>
           <div class="flipr-hint">On the Item Market, click a listing to see its price minus Torn's 5% sales tax, with a Copy button. Read-only - it never fills or clicks anything for you.</div>
+          <label class="flipr-checkbox-row">
+            <input type="checkbox" id="flipr-market-quality">
+            Show weapon/armour quality and bonuses
+          </label>
+          <div class="flipr-hint">Draws a "Q %" quality badge and the bonus percentages onto each weapon/armour on the Item Market, Bazaar, your Items page, any Display Case and your Faction Armory. Read-only - it reads what the page already shows (and, on the Item Market, the page's own listing data) and adds no API calls. If another quality-overlay script has already tagged a listing, FLIPR steps aside on it.</div>
+        </div>
+        <div class="flipr-section">
+          <h4>Player trades</h4>
+          <label class="flipr-checkbox-row">
+            <input type="checkbox" id="flipr-track-trades">
+            Track completed player trades
+          </label>
+          <div class="flipr-hint">When you open a finished trade's log (trade.php), FLIPR reads what changed hands: money for one item = a buy (into Holdings) or a sale (into Profits, no tax). Read-only - it only reads the log page you opened, and each trade is recorded once. Multi-item or item-for-item trades are noted but not auto-priced (no honest way to split one lump of money across different items).</div>
+        </div>
+        <div class="flipr-section">
+          <h4>Launcher</h4>
+          <label class="flipr-checkbox-row">
+            <input type="checkbox" id="flipr-launcher-dock">
+            Dock button to Torn's bottom bar
+          </label>
+          <div class="flipr-hint">Off (default): a floating button you drag anywhere and tap to open. On: hides that floating button and puts a fixed "F" next to the Notes/People icons in Torn's bottom bar - easier to open and close on the PDA than dragging. The panel still drags and closes the same way once open.</div>
         </div>
         <div class="flipr-section">
           <h4>API key</h4>
@@ -1314,6 +1480,7 @@
         </div>
       </div>
     </div>
+    <div id="flipr-resize" title="Drag to resize FLIPR"></div>
   `;
   // Defensive, not a known fix: <body> is expected to exist by the time this runs on
   // both targets (at document-end it is parsed, and the PDA injects after
@@ -1455,13 +1622,109 @@
     document.addEventListener('pointercancel', onPanelDragEnd);
   });
 
-  applyPanelPosition(); // restore wherever it was last dragged to, if anywhere
+  ////////////////////////////////////////////////////////////////////////////
+  ////  PANEL RESIZE
+  ////////////////////////////////////////////////////////////////////////////
+  //
+  // A pointer-driven grip in the bottom-right corner sets the panel WIDTH (inline on
+  // #flipr-panel) and the scroll-area HEIGHT (inline on .flipr-body). Both are saved in
+  // settings.panelSize and re-applied on load, so a size survives refresh until the
+  // user drags it again. Same reasons as the drag code above for using pointer events
+  // rather than the CSS `resize` property: `resize` is unreliable inside the PDA
+  // webview and gives no way to persist or clamp the result.
+  //
+  // Width lives on the panel; height lives on the body (not the panel) so the header
+  // stays its natural height and only the scrolling content grows - matching what the
+  // default max-height already did. Both values are clamped on the way in AND on the
+  // way out (applyPanelSize) so a size saved on a big screen cannot strand the panel
+  // off a small one.
+  const PANEL_MIN_W = 280;
+  const PANEL_MAX_W = 720;
+  const PANEL_MIN_BODY_H = 120;
+  let resizeState = null;
+
+  function panelMaxWidth() {
+    return Math.max(Math.min(PANEL_MAX_W, window.innerWidth - 20), PANEL_MIN_W);
+  }
+  function panelMaxBodyHeight() {
+    // Leave room for the header and a margin so the panel never taller than the screen.
+    return Math.max(window.innerHeight - 120, PANEL_MIN_BODY_H);
+  }
+
+  function applyPanelSize() {
+    const size = settings.panelSize;
+    const body = $('.flipr-body');
+    if (!size) {
+      // Never resized in this install: clear the inline overrides and let the
+      // stylesheet's 300px width / max-height take over again.
+      panel.style.width = '';
+      if (body) { body.style.height = ''; body.style.maxHeight = ''; }
+      return;
+    }
+    panel.style.width = Math.min(Math.max(size.width, PANEL_MIN_W), panelMaxWidth()) + 'px';
+    if (body) {
+      const h = Math.min(Math.max(size.bodyHeight, PANEL_MIN_BODY_H), panelMaxBodyHeight());
+      body.style.height = h + 'px';
+      body.style.maxHeight = h + 'px';
+    }
+  }
+
+  function onResizeMove(e) {
+    if (!resizeState) return;
+    const dx = e.clientX - resizeState.startX;
+    const dy = e.clientY - resizeState.startY;
+    const w = Math.min(Math.max(resizeState.startW + dx, PANEL_MIN_W), panelMaxWidth());
+    const h = Math.min(Math.max(resizeState.startH + dy, PANEL_MIN_BODY_H), panelMaxBodyHeight());
+    resizeState.curW = w;
+    resizeState.curH = h;
+    panel.style.width = w + 'px';
+    resizeState.body.style.height = h + 'px';
+    resizeState.body.style.maxHeight = h + 'px';
+  }
+
+  function onResizeEnd() {
+    document.removeEventListener('pointermove', onResizeMove);
+    document.removeEventListener('pointerup', onResizeEnd);
+    document.removeEventListener('pointercancel', onResizeEnd);
+    if (!resizeState) return;
+    settings.panelSize = { width: resizeState.curW, bodyHeight: resizeState.curH };
+    saveSettings(settings);
+    resizeState = null;
+    // Growing toward the right/bottom edge can push the panel partly off-screen;
+    // re-clamp its position against the new size, exactly as a rotate/resize does.
+    applyPanelPosition();
+  }
+
+  $('#flipr-resize').addEventListener('pointerdown', (e) => {
+    if (e.button != null && e.button !== 0) return; // left/primary or touch only
+    e.preventDefault();
+    e.stopPropagation(); // the grip overlaps the panel; don't also start a header/panel drag
+    const body = $('.flipr-body');
+    if (!body) return;
+    const panelRect = panel.getBoundingClientRect();
+    const bodyRect = body.getBoundingClientRect();
+    resizeState = {
+      startX: e.clientX, startY: e.clientY,
+      startW: panelRect.width, startH: bodyRect.height,
+      curW: panelRect.width, curH: bodyRect.height,
+      body: body
+    };
+    document.addEventListener('pointermove', onResizeMove);
+    document.addEventListener('pointerup', onResizeEnd);
+    document.addEventListener('pointercancel', onResizeEnd);
+  });
+
+  applyPanelSize();     // restore a saved manual size first, so the position clamp below
+  applyPanelPosition(); // measures the restored size and keeps it fully on-screen
 
   // Rotating a phone (or resizing a window) can leave a saved spot beyond the new
   // viewport - re-applying re-clamps it back into view. Skipped entirely when this
   // state has no saved spot, so the default-position case costs nothing on the
   // resize storm a mobile browser fires while its address bar hides and shows.
   window.addEventListener('resize', () => {
+    // Re-clamp a saved manual size first (a size that fit a big screen may be too wide
+    // or tall for the new viewport), then re-clamp the position against that size.
+    if (settings.panelSize) applyPanelSize();
     if (currentPanelPos()) applyPanelPosition();
   });
 
@@ -1480,6 +1743,209 @@
     saveSettings(settings);
   });
 
+  ////////////////////////////////////////////////////////////////////////////
+  ////  DOCKED LAUNCHER (bottom-bar open/close button)
+  ////////////////////////////////////////////////////////////////////////////
+  // An alternative to the floating round puck: a small "F" wedged into Torn's
+  // bottom bar next to the Notes/People icons, so the panel opens and closes
+  // from a fixed, easy-to-hit target instead of a button you have to drag
+  // around. Asked for by -IBY- [3603459] as a PDA convenience (chasing a
+  // floating button around a phone screen is fiddly). Same anchor + re-attach
+  // idea the Supply Pack Analyzer uses. Only built while launcherMode is
+  // 'docked'; in 'float' mode none of this runs and nothing is added to the bar.
+  let dockObserver = null;
+  let dockRecheckQueued = false;
+  let dockDrag = null;         // in-progress reorder drag of the docked button, or null
+  let dockJustDragged = false; // true between a drag ending and the click it spawns
+
+  // Torn's bottom bar is thrown away and rebuilt on its SPA navigations, taking
+  // our button with it; the observer below puts it back. Notes and People are
+  // the two stable ids in that bar, so we anchor to whichever exists.
+  function findDockAnchor() {
+    return document.getElementById('notes_panel_button') ||
+           document.getElementById('people_panel_button');
+  }
+
+  // Pure open/close toggle for the panel, mirroring the header click. "Closed"
+  // in docked mode is fully hidden (see the .flipr-docked.flipr-collapsed CSS),
+  // so this just flips collapsed and re-applies position/label the same way.
+  function toggleFromDock() {
+    panel.classList.toggle('flipr-collapsed');
+    settings.collapsed = panel.classList.contains('flipr-collapsed');
+    const tgl = $('#flipr-toggle');
+    if (tgl) tgl.textContent = settings.collapsed ? String.fromCharCode(0x25B8) : String.fromCharCode(0x25BE);
+    applyPanelPosition();
+    saveSettings(settings);
+  }
+
+  function ensureDockButton() {
+    if (settings.launcherMode !== 'docked') return;
+    if (document.getElementById('flipr-dock-btn')) return; // already in place
+    const anchor = findDockAnchor();
+    if (!anchor || !anchor.parentNode) return; // bar not built yet - observer retries
+    // Build it as a real <button> that borrows the Notes/People button's own
+    // class list, so ours drops into Torn's bottom bar as a first-class member -
+    // same slot, same sizing, same hit area - and a tap registers exactly the
+    // way theirs does. The earlier version inserted a bare <span>: it rendered
+    // in the bar and looked right, but the bar's own layout left it without a
+    // working tap target, so pressing it did nothing (no listener, plain or
+    // delegated, ever saw the click). This is how the Supply Pack Analyzer's
+    // docked button is built, and it is reliable on the PDA. Click is bound
+    // straight on the button; if Torn ever rebuilds the bar the observer
+    // re-creates it and re-binds.
+    const btn = document.createElement('button');
+    btn.id = 'flipr-dock-btn';
+    btn.type = 'button';
+    btn.className = anchor.className; // inherit Torn's bar-button styling + hit area
+    btn.title = 'FLIPR - open/close (drag to reorder)';
+    btn.textContent = 'F';
+    // Size the blue tile to sit level with the neighbouring bar icons instead of
+    // guessing - measured off the anchor and clamped so an odd box never makes it
+    // huge or tiny. Falls back to the CSS 24px if the bar has not laid out yet.
+    const ar = anchor.getBoundingClientRect();
+    const side = Math.round(Math.min(ar.width || 24, ar.height || 24));
+    if (side >= 16 && side <= 40) { btn.style.width = side + 'px'; btn.style.height = side + 'px'; }
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (dockJustDragged) { dockJustDragged = false; return; } // that click ended a drag, not a tap
+      toggleFromDock();
+    });
+    makeDockButtonDraggable(btn);
+    anchor.parentNode.appendChild(btn);
+    applyDockIndex(btn); // drop it back at the slot it was last dragged to
+  }
+
+  // Lets the docked button be dragged left/right to sit anywhere among the other
+  // buttons in Torn's bottom bar, instead of always at the end. Pointer events,
+  // not HTML5 drag-and-drop (which the PDA handles poorly), so it behaves the
+  // same on desktop and in the app; the same movement-threshold trick the
+  // floating puck uses tells a reorder drag apart from a plain open/close tap.
+  function makeDockButtonDraggable(btn) {
+    btn.addEventListener('pointerdown', (e) => {
+      if (e.button != null && e.button !== 0) return; // primary button / touch only
+      dockJustDragged = false; // clear any stale flag so a fresh tap is never eaten
+      dockDrag = { startX: e.clientX, startY: e.clientY, moved: false };
+      document.addEventListener('pointermove', onDockDragMove);
+      document.addEventListener('pointerup', onDockDragEnd);
+      document.addEventListener('pointercancel', onDockDragEnd);
+    });
+  }
+
+  function onDockDragMove(e) {
+    if (!dockDrag) return;
+    const dx = e.clientX - dockDrag.startX;
+    const dy = e.clientY - dockDrag.startY;
+    if (!dockDrag.moved && (Math.abs(dx) > DRAG_CLICK_THRESHOLD_PX || Math.abs(dy) > DRAG_CLICK_THRESHOLD_PX)) {
+      dockDrag.moved = true;
+      const b = document.getElementById('flipr-dock-btn');
+      if (b) b.classList.add('flipr-dock-dragging');
+    }
+    if (!dockDrag.moved) return;
+    const btn = document.getElementById('flipr-dock-btn');
+    if (!btn || !btn.parentNode) return;
+    const parent = btn.parentNode;
+    // Reorder live: sort the sibling buttons by their on-screen x (so a flex row
+    // that is not in DOM order still reorders correctly), find the first whose
+    // centre is past the pointer, and slot in ahead of it; past the last, go last.
+    const sibs = [...parent.children].filter((s) => {
+      if (s === btn) return false;
+      const r = s.getBoundingClientRect();
+      return r.width > 0 || r.height > 0; // skip hidden siblings
+    }).sort((a, b2) => a.getBoundingClientRect().left - b2.getBoundingClientRect().left);
+    let target = null;
+    for (const sib of sibs) {
+      const r = sib.getBoundingClientRect();
+      if (e.clientX < r.left + r.width / 2) { target = sib; break; }
+    }
+    if (target) {
+      if (btn.nextElementSibling !== target) parent.insertBefore(btn, target);
+    } else if (parent.lastElementChild !== btn) {
+      parent.appendChild(btn);
+    }
+  }
+
+  function onDockDragEnd() {
+    document.removeEventListener('pointermove', onDockDragMove);
+    document.removeEventListener('pointerup', onDockDragEnd);
+    document.removeEventListener('pointercancel', onDockDragEnd);
+    if (!dockDrag) return;
+    if (dockDrag.moved) {
+      const btn = document.getElementById('flipr-dock-btn');
+      if (btn && btn.parentNode) {
+        btn.classList.remove('flipr-dock-dragging');
+        // Save as an index among the bar's buttons (see loadSettings.dockIndex).
+        settings.dockIndex = [...btn.parentNode.children].indexOf(btn);
+        saveSettings(settings);
+      }
+      dockJustDragged = true; // stop the trailing click from also toggling the panel
+    }
+    dockDrag = null;
+  }
+
+  // Puts the button back at its saved slot after it is (re)created - on load and
+  // whenever Torn rebuilds the bar. Index-based and clamped: if the bar now holds
+  // fewer buttons than when the index was saved, it just lands at the end.
+  function applyDockIndex(btn) {
+    if (settings.dockIndex == null || !btn.parentNode) return;
+    const others = [...btn.parentNode.children].filter((c) => c !== btn);
+    const ref = others[settings.dockIndex] || null; // out of range => null => append at end
+    btn.parentNode.insertBefore(btn, ref);
+  }
+
+  function removeDockButton() {
+    const btn = document.getElementById('flipr-dock-btn');
+    if (btn && btn.parentNode) btn.parentNode.removeChild(btn);
+  }
+
+  // Throttled to one re-check per frame: Torn churns the DOM constantly, and a
+  // rebuild scan on every single mutation would be wasteful - a check on the
+  // next frame after a burst catches the bar getting swapped out just as well.
+  function startDockObserver() {
+    if (dockObserver) return;
+    dockObserver = new MutationObserver(() => {
+      if (dockRecheckQueued) return;
+      dockRecheckQueued = true;
+      requestAnimationFrame(() => {
+        dockRecheckQueued = false;
+        ensureDockButton();
+      });
+    });
+    dockObserver.observe(document.body || document.documentElement, { childList: true, subtree: true });
+  }
+
+  function stopDockObserver() {
+    if (!dockObserver) return;
+    dockObserver.disconnect();
+    dockObserver = null;
+  }
+
+  // Switches the widget between the two launcher styles. Safe to call any time -
+  // at startup and live from the settings toggle: it sets the panel's docked
+  // class, then either stands up the bottom-bar button and its re-attach
+  // observer, or tears them down and lets the floating puck take over again.
+  function applyLauncherMode() {
+    const docked = settings.launcherMode === 'docked';
+    panel.classList.toggle('flipr-docked', docked);
+    if (docked) {
+      ensureDockButton();
+      startDockObserver();
+    } else {
+      stopDockObserver();
+      removeDockButton();
+    }
+    applyPanelPosition();
+  }
+
+  applyLauncherMode(); // stand up whichever launcher the saved setting asks for
+
+  $('#flipr-launcher-dock').checked = settings.launcherMode === 'docked';
+  $('#flipr-launcher-dock').addEventListener('change', (e) => {
+    settings.launcherMode = e.target.checked ? 'docked' : 'float';
+    saveSettings(settings);
+    applyLauncherMode();
+  });
+
   $('#flipr-scan-page-text').checked = settings.scanPageText;
   $('#flipr-scan-page-text').addEventListener('change', (e) => {
     settings.scanPageText = e.target.checked;
@@ -1492,6 +1958,20 @@
     settings.marketTaxHelper = e.target.checked;
     saveSettings(settings);
     if (!settings.marketTaxHelper) hideTaxPopover();
+  });
+
+  $('#flipr-market-quality').checked = settings.marketQuality;
+  $('#flipr-market-quality').addEventListener('change', (e) => {
+    settings.marketQuality = e.target.checked;
+    saveSettings(settings);
+    applyMarketQuality(); // draw the overlay now, or strip it back off, live
+  });
+
+  $('#flipr-track-trades').checked = settings.trackTrades;
+  $('#flipr-track-trades').addEventListener('change', (e) => {
+    settings.trackTrades = e.target.checked;
+    saveSettings(settings);
+    if (settings.trackTrades) scanTradeLog(); // re-read the trade currently open, if any
   });
 
   $('#flipr-holdings-lump').checked = settings.holdingsMode === 'lump';
@@ -1649,6 +2129,8 @@
         scanPageText: settings.scanPageText,
         holdingsMode: settings.holdingsMode,
         marketTaxHelper: settings.marketTaxHelper,
+        marketQuality: settings.marketQuality,
+        trackTrades: settings.trackTrades,
         activeTab: settings.activeTab,
         // Read alongside platform.viewport above: a panel reported as missing or
         // half off-screen is usually a saved spot that no longer fits the screen.
@@ -1755,18 +2237,39 @@
 
         const nameSpan = document.createElement('span');
         nameSpan.className = 'flipr-holding-name';
-        nameSpan.textContent = `${entry.itemName} \u00D7${entry.qty}`;
-        nameSpan.title = entry.itemName;
-
-        const metaSpan = document.createElement('span');
-        metaSpan.className = 'flipr-holding-meta';
+        // Meta text is computed once so it can appear both in the meta column and,
+        // with the name and qty, in the name's hover title (below).
         const costLabel = entry.isLump ? 'avg' : '/unit';
         // At 0% fee (Bazaar), breakeven is mathematically identical to cost -
         // showing both is just noise, so only add it once a fee actually
         // pushes it above cost (Market/Anonymous).
-        metaSpan.textContent = (fee > 0
+        const metaText = (fee > 0
           ? `${money(entry.unitCost)} ${costLabel} \u00B7 b/e ${money(breakeven(entry.unitCost, fee))}`
           : `${money(entry.unitCost)} ${costLabel}`) + formatStats(entry.stats);
+
+        // Name and the "\u00D7N" count are separate children so ONLY the count is
+        // click-to-edit - clicking the item name does nothing, matching the price
+        // column where just the number is live. The count is underlined so it reads
+        // as an editable field rather than plain label text.
+        nameSpan.appendChild(document.createTextNode(entry.itemName + ' '));
+        const qtySpan = document.createElement('span');
+        qtySpan.className = 'flipr-holding-qty';
+        qtySpan.textContent = `\u00D7${entry.qty}`;
+        qtySpan.style.cursor = 'pointer';
+        qtySpan.style.textDecoration = 'underline dotted';
+        qtySpan.title = entry.isLump
+          ? 'Click to correct the count (down only) - e.g. an untracked sale reduced it'
+          : 'Click to correct the count - e.g. you sold some and it was not caught';
+        qtySpan.addEventListener('click', (e) => { e.stopPropagation(); startQtyEdit(qtySpan, entry); });
+        nameSpan.appendChild(qtySpan);
+        // The name column ellipsis-clips long item names, so the hover title carries
+        // the whole row untruncated: full name, qty, and the same price/breakeven/
+        // stats shown in the meta column - "hover to read all of it".
+        nameSpan.title = `${entry.itemName} \u00D7${entry.qty} \u00B7 ${metaText}`;
+
+        const metaSpan = document.createElement('span');
+        metaSpan.className = 'flipr-holding-meta';
+        metaSpan.textContent = metaText;
 
         // Click the price to correct it. The X deletes the row outright, which is a
         // blunt instrument when all that is wrong is the number.
@@ -2043,6 +2546,12 @@
     if (scan) scan.checked = settings.scanPageText;
     const tax = $('#flipr-market-tax');
     if (tax) tax.checked = settings.marketTaxHelper;
+    const mq = $('#flipr-market-quality');
+    if (mq) mq.checked = settings.marketQuality;
+    const tt = $('#flipr-track-trades');
+    if (tt) tt.checked = settings.trackTrades;
+    const dock = $('#flipr-launcher-dock');
+    if (dock) dock.checked = settings.launcherMode === 'docked';
   }
 
   // Realized-profit view: a summary block (the numbers RiotFrog asked for) plus a
@@ -2108,19 +2617,24 @@
 
       const nameSpan = document.createElement('span');
       nameSpan.className = 'flipr-holding-name';
-      nameSpan.textContent = `${rec.itemName} \u00D7${rec.qty}`;
-      nameSpan.title = rec.itemName;
 
       const metaSpan = document.createElement('span');
       metaSpan.className = 'flipr-holding-meta';
+      let metaText;
       if (rec.matchedQty > 0) {
         const sign = rec.profit >= 0 ? '+' : '';
         metaSpan.style.color = rec.profit >= 0 ? '#6c6' : '#e66';
         const partial = rec.matchedQty < rec.qty ? ` (${rec.matchedQty}/${rec.qty})` : '';
-        metaSpan.textContent = `${sign}${money(rec.profit)}${partial}${formatStats(rec.stats)}`;
+        metaText = `${sign}${money(rec.profit)}${partial}${formatStats(rec.stats)}`;
       } else {
-        metaSpan.textContent = `${money(rec.proceeds)} \u00B7 no basis`;
+        metaText = `${money(rec.proceeds)} \u00B7 no basis`;
       }
+      metaSpan.textContent = metaText;
+
+      nameSpan.textContent = `${rec.itemName} \u00D7${rec.qty}`;
+      // Full untruncated detail on hover (same idea as renderHoldings): the name
+      // column clips long names, so the title carries name, qty and the profit line.
+      nameSpan.title = `${rec.itemName} \u00D7${rec.qty} \u00B7 ${metaText}`;
 
       row.appendChild(nameSpan);
       row.appendChild(metaSpan);
@@ -2844,7 +3358,7 @@ yasukuni sword|65|70|49|54
     if (!node || !node.querySelectorAll) return null;
     const icons = [];
     for (const icon of node.querySelectorAll('i[class*="bonus-attachment-item-"]')) {
-      if (/bonus-attachment-item-(damage|accuracy|armou?r)-bonus/i.test(icon.getAttribute('class') || '')) icons.push(icon);
+      if (/bonus-attachment-item-(damage|accuracy|armou?r|defen[cs]e)-bonus/i.test(icon.getAttribute('class') || '')) icons.push(icon);
     }
     if (!icons.length) return null;
     const groupOf = (icon) => (icon.parentElement && icon.parentElement.parentElement) || null;
@@ -2854,7 +3368,7 @@ yasukuni sword|65|70|49|54
     }
     let dmg = null, acc = null, armor = null;
     for (const icon of icons) {
-      const kind = icon.getAttribute('class').match(/bonus-attachment-item-(damage|accuracy|armou?r)-bonus/i)[1].toLowerCase();
+      const kind = icon.getAttribute('class').match(/bonus-attachment-item-(damage|accuracy|armou?r|defen[cs]e)-bonus/i)[1].toLowerCase();
       const container = icon.parentElement;
       const valEl = container && (container.querySelector('.t-overflow') || container.querySelector('span'));
       if (!valEl) continue;
@@ -2862,7 +3376,7 @@ yasukuni sword|65|70|49|54
       if (!(val > 0)) continue;
       if (kind === 'damage') { if (dmg == null) dmg = val; }
       else if (kind === 'accuracy') { if (acc == null) acc = val; }
-      else if (armor == null) armor = val; // "armor" or "armour"
+      else if (armor == null) armor = val; // "armor"/"armour" (Item Market) or "defence" (bazaar)
     }
     return (dmg == null && acc == null && armor == null) ? null : { dmg, acc, armor };
   }
@@ -3175,6 +3689,263 @@ yasukuni sword|65|70|49|54
   function isItemMarketPage() {
     return /\/page\.php/i.test(location.pathname) && /sid=itemmarket/i.test(location.search);
   }
+
+  ////////////////////////////////////////////////////////////////////////////
+  ////  PLAYER TRADE LOG (record a completed trade as a buy/sale)
+  ////////////////////////////////////////////////////////////////////////////
+  // When you open a completed trade's log on trade.php, read what changed hands and
+  // record a clean single-item trade into your books: money one side + exactly one
+  // item type the other. A buy goes into Holdings, a sale into Profits (a trade has
+  // no 5% market tax). Anything more complex (several item types, item-for-item
+  // swaps, money on both sides) is NOTED and skipped - there is no honest way to
+  // split one lump of money across different items. All cases mark the trade ID done
+  // so a re-render/reload can't re-toast or re-record it. Read-only: it only reads
+  // the log page you opened; it never accepts, cancels, fills, or clicks anything.
+
+  // A completed trade lives on trade.php under an ID. Torn has shipped this view under
+  // more than one step name (step=logview historically, step=view on the current
+  // site), so we DON'T gate on the step string - what actually makes a page recordable
+  // is proven inside readTradeLog: it requires the .trade-cont columns AND the "the
+  // trade was accepted by" line before it records anything.
+  function isTradeLogPage() {
+    const q = location.hash + '&' + location.search;
+    return /\/trade\.php/i.test(location.pathname) && /[?&#]ID=\d+/i.test(q);
+  }
+
+  function currentTradeId() {
+    const m = (location.hash + '&' + location.search).match(/[?&#]ID=(\d+)/i);
+    return m ? m[1] : null;
+  }
+
+  // Persistent "already recorded" ledger, keyed on the trade ID. Capped so it can't
+  // grow without bound; only IDs matter, not order.
+  let processedTrades = loadProcessedTrades();
+  function loadProcessedTrades() {
+    try {
+      const a = JSON.parse(Store.get(PROCESSED_TRADES_KEY, '[]'));
+      return Array.isArray(a) ? a.map(String) : [];
+    } catch (e) {
+      return [];
+    }
+  }
+  function isTradeProcessed(id) {
+    return processedTrades.includes(String(id));
+  }
+  function markTradeProcessed(id) {
+    id = String(id);
+    if (processedTrades.includes(id)) return;
+    processedTrades.push(id);
+    if (processedTrades.length > 500) processedTrades = processedTrades.slice(-500);
+    try {
+      Store.set(PROCESSED_TRADES_KEY, JSON.stringify(processedTrades));
+    } catch (e) {
+      log('markTradeProcessed save failed', e);
+    }
+  }
+
+  // Who am I. Read straight off the page (works on every Torn page, no API call):
+  // the "View Profile" link in the user menu carries your own XID, and another link
+  // to that same XID carries your name. Cached after the first resolve.
+  let selfIdentity = null;
+  function getSelfIdentity() {
+    if (selfIdentity) return selfIdentity;
+    let id = null, name = null;
+    const anchors = Array.from(document.querySelectorAll('a[href*="profiles.php?XID="]'));
+    const vp = anchors.find((a) => /view profile/i.test((a.textContent || '').trim()));
+    if (vp) {
+      const m = vp.href.match(/XID=(\d+)/);
+      if (m) id = m[1];
+    }
+    if (id) {
+      const named = anchors.find(
+        (a) => a.href.includes('XID=' + id) && (a.textContent || '').trim() && !/view profile/i.test(a.textContent)
+      );
+      if (named) name = (named.textContent || '').trim();
+    }
+    if (!name) {
+      // Sidebar "Name:" row fallback (its container class is hashed, so anchor by the label text).
+      const label = Array.from(document.querySelectorAll('*')).find(
+        (el) => el.children.length === 0 && (el.textContent || '').trim() === 'Name:'
+      );
+      if (label && label.parentElement) {
+        const t = (label.parentElement.textContent || '').replace(/name:/i, '').trim();
+        if (t) name = t;
+      }
+    }
+    if (id || name) selfIdentity = { id, name };
+    return selfIdentity;
+  }
+
+  // Parse one .user column into { name, money, items:[{name,qty}], resolved }.
+  function parseTradeSide(userEl) {
+    const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const header = userEl.querySelector('.title-black') || userEl.firstElementChild;
+    let name = header ? clean(header.textContent) : '';
+    name = name.replace(/'s items traded\s*$/i, '').trim();
+
+    let money = 0, hasMoney = false, sawItemsLine = false;
+    const items = [];
+    const seen = new Set();
+    const rows = Array.from(userEl.querySelectorAll('.cont .name'));
+    for (const r of rows) {
+      if (seen.has(r)) continue;
+      seen.add(r);
+      const t = clean(r.textContent);
+      if (!t) continue;
+      if (/no money in trade/i.test(t)) { hasMoney = true; continue; }
+      const mm = t.match(/\$([\d,]+)\s*in trade/i);
+      if (mm) { money = Number(mm[1].replace(/,/g, '')); hasMoney = true; continue; }
+      if (/no items in trade/i.test(t) || /no properties in trade/i.test(t)) { sawItemsLine = true; continue; }
+      if (/in trade$/i.test(t)) continue; // any other "... in trade" summary line
+      // Item row: "Name x10" or "10x Name"; bare name is a single non-stackable copy.
+      let im = t.match(/^(.+?)\s*x\s*([\d,]+)$/i);
+      if (im) { items.push({ name: im[1].trim(), qty: Number(im[2].replace(/,/g, '')) || 1 }); sawItemsLine = true; continue; }
+      im = t.match(/^([\d,]+)\s*x\s+(.+)$/i);
+      if (im) { items.push({ name: im[2].trim(), qty: Number(im[1].replace(/,/g, '')) || 1 }); sawItemsLine = true; continue; }
+      items.push({ name: t, qty: 1 }); sawItemsLine = true;
+    }
+    // Fallback if the money label wasn't inside a .name element for some layout.
+    if (!hasMoney) {
+      const mm = clean(userEl.textContent).match(/\$([\d,]+)\s*in trade/i);
+      if (mm) { money = Number(mm[1].replace(/,/g, '')); hasMoney = true; }
+    }
+    // `resolved` = this column has finished rendering both its money and its items
+    // summary lines. A half-rendered React column (accepted line already on screen,
+    // rows not yet in) would otherwise parse as an empty side and get mis-classified
+    // as an un-priceable trade, burning the ID on the processed ledger for good.
+    return { name, money, items, resolved: hasMoney && sawItemsLine };
+  }
+
+  // Parse "14:54:57 - 03/07/26" (DD/MM/YY) near the accepted line into unix seconds.
+  function acceptedTsSeconds(text) {
+    const m = text.match(/(\d{2}):(\d{2}):(\d{2})\s*-\s*(\d{2})\/(\d{2})\/(\d{2})[\s\S]{0,60}?the trade was accepted by/i);
+    if (!m) return Math.floor(Date.now() / 1000);
+    const [, HH, MM, SS, dd, mo, yy] = m;
+    const d = new Date(2000 + Number(yy), Number(mo) - 1, Number(dd), Number(HH), Number(MM), Number(SS));
+    const t = Math.floor(d.getTime() / 1000);
+    return Number.isFinite(t) ? t : Math.floor(Date.now() / 1000);
+  }
+
+  function readTradeLog() {
+    if (!settings.trackTrades) return;
+    if (!isTradeLogPage()) return;
+    const tradeId = currentTradeId();
+    if (!tradeId || isTradeProcessed(tradeId)) return;
+
+    const cont = document.querySelector('.trade-cont');
+    if (!cont) return; // React hasn't rendered the trade yet - the observer will call again
+    const pageText = document.body ? document.body.textContent : '';
+    if (!/the trade was accepted by/i.test(pageText)) return; // not a completed/accepted trade
+
+    const left = cont.querySelector('.user.left');
+    const right = cont.querySelector('.user.right');
+    if (!left || !right) return;
+
+    const self = getSelfIdentity();
+    if (!self || !self.name) return; // can't tell which side is me - retry on a later load
+    const norm = (s) => normalize(String(s || ''));
+    const sides = [parseTradeSide(left), parseTradeSide(right)];
+    if (!sides[0].resolved || !sides[1].resolved) return; // columns still rendering - retry, don't mark done
+    let mine = null, theirs = null;
+    if (norm(sides[0].name) === norm(self.name)) { mine = sides[0]; theirs = sides[1]; }
+    else if (norm(sides[1].name) === norm(self.name)) { mine = sides[1]; theirs = sides[0]; }
+    if (!mine) return; // neither header matched my name; don't guess, don't mark done
+
+    const tsSeconds = acceptedTsSeconds(pageText);
+
+    // BUY: I paid money for exactly one item type, and gave no items of my own.
+    if (mine.money > 0 && mine.items.length === 0 && theirs.money === 0 && theirs.items.length === 1) {
+      const it = theirs.items[0];
+      const unitCost = mine.money / it.qty;
+      const lotEntry = addLot(it.name, it.qty, unitCost, `trade:${tradeId}`, null, null);
+      markTradeProcessed(tradeId);
+      if (lotEntry) {
+        renderAll();
+        showToast(
+          `FLIPR logged trade buy: ${it.qty}× ${it.name} @ ${money(unitCost)}`,
+          () => undoLotQty(lotEntry.id, it.qty)
+        );
+      }
+      return;
+    }
+
+    // SELL: I gave exactly one item type and got money for it (a trade has no tax).
+    if (mine.items.length === 1 && mine.money === 0 && theirs.money > 0 && theirs.items.length === 0) {
+      const it = mine.items[0];
+      recordSale(it.name, it.qty, theirs.money, 0, 'trade', tsSeconds);
+      markTradeProcessed(tradeId);
+      renderAll();
+      showToast(`FLIPR logged trade sale: ${it.qty}× ${it.name} for ${money(theirs.money)} (no tax)`);
+      return;
+    }
+
+    // Everything else is noted, not priced - marking it done so it can't re-toast.
+    markTradeProcessed(tradeId);
+    let why;
+    if (mine.items.length > 1 || theirs.items.length > 1) why = 'several item types';
+    else if (mine.items.length && theirs.items.length) why = 'item-for-item swap';
+    else if (mine.money && theirs.money) why = 'money on both sides';
+    else if (mine.items.length + theirs.items.length === 0) why = 'no items';
+    else why = 'mixed items and money';
+    showToast(`FLIPR: trade #${tradeId} not auto-priced (${why}) - log it by hand if you want it tracked`);
+  }
+
+  // Debounced entry point: trade.php is a React SPA that renders the log a moment
+  // after navigation, so this is called from an observer, on hashchange, and once at
+  // init; readTradeLog is idempotent (guards on the processed ledger) so extra calls
+  // are harmless.
+  let tradeScanScheduled = false;
+  function scanTradeLog() {
+    if (!/\/trade\.php/i.test(location.pathname)) return;
+    startTradePoll(); // event triggers can be starved in the userscript sandbox - poll as a safety net
+    if (tradeScanScheduled) return;
+    tradeScanScheduled = true;
+    setTimeout(() => {
+      tradeScanScheduled = false;
+      try { readTradeLog(); } catch (e) { log('readTradeLog failed', e); }
+    }, 400);
+  }
+
+  // Belt-and-suspenders invocation for the trade reader. Tampermonkey sandboxes the
+  // script, and on Torn's trade SPA the event-based triggers can all miss (a
+  // hashchange or pushState done on the page's real history never reaches our wrap),
+  // so a completed trade you reach by clicking through the site could render with no
+  // watcher ever calling readTradeLog. A bounded setInterval (which fires reliably in
+  // the sandbox) closes that gap: it re-reads every 700ms until the trade is recorded,
+  // we leave trade.php, or the cap is hit. readTradeLog self-dedupes on the processed
+  // ledger and bails off trade.php, so the poll cannot double-count or leak.
+  let tradePollTimer = null;
+  function startTradePoll() {
+    if (tradePollTimer) return;
+    if (!settings.trackTrades) return;
+    if (!/\/trade\.php/i.test(location.pathname)) return;
+    let ticks = 0;
+    tradePollTimer = setInterval(() => {
+      ticks += 1;
+      try { readTradeLog(); } catch (e) { log('trade poll readTradeLog failed', e); }
+      const done = ticks >= 25 || !/\/trade\.php/i.test(location.pathname) ||
+        (currentTradeId() && isTradeProcessed(currentTradeId()));
+      if (done) { clearInterval(tradePollTimer); tradePollTimer = null; }
+    }, 700);
+  }
+
+  // Persistent trade-log watcher: attach ONE body-scoped observer unconditionally and
+  // redraw on hashchange/popstate/pushState, so a completed trade is caught however
+  // you arrive at it (fresh load, Past-Trades click, or in-site navigation).
+  window.addEventListener('hashchange', () => scanTradeLog());
+  window.addEventListener('popstate', () => scanTradeLog());
+  try {
+    new MutationObserver(() => scanTradeLog())
+      .observe(document.body || document.documentElement, { childList: true, subtree: true });
+  } catch (e) {
+    log('trade observer attach failed', e);
+  }
+  try {
+    const wrapHist = (orig) => function () { const r = orig.apply(this, arguments); try { scanTradeLog(); } catch (e) { /* ignore */ } return r; };
+    history.pushState = wrapHist(history.pushState);
+    history.replaceState = wrapHist(history.replaceState);
+  } catch (e) { /* history not writable - hashchange + observer still cover most cases */ }
+  scanTradeLog();
 
   ////////////////////////////////////////////////////////////////////////////
   ////  MARKET TAX HELPER (click a listing -> price minus 5% tax, with Copy)
@@ -3539,6 +4310,19 @@ yasukuni sword|65|70|49|54
     return !!(el && el.closest && el.closest(HISTORY_FEED_SELECTOR));
   }
 
+  // A chat message can carry the exact "You bought Nx Item for a total of $X"
+  // wording - someone pastes or shares their own transaction into faction/company
+  // chat, the observer sees a brand new chat node whose text matches a
+  // confirmation regex, and THEIR purchase gets logged as if it were yours
+  // (reported: a faction-mate's shared buy landed in Holdings). All Torn chat
+  // lives under #chatRoot (the same anchor the tax-popover exclusion uses), and a
+  // genuine on-page purchase confirmation never renders inside it, so anything in
+  // there is skipped outright - it can only ever be someone else's text.
+  function isInsideChat(node) {
+    const el = node && node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+    return !!(el && el.closest && el.closest('#chatRoot'));
+  }
+
   function scanMutationsForPurchaseText(mutations) {
     for (const mutation of mutations) {
       if (mutation.type === 'characterData') {
@@ -3550,6 +4334,7 @@ yasukuni sword|65|70|49|54
         const text = mutation.target.textContent;
         if (!text || !/you bought/i.test(text)) continue;
         if (isInsideHistoryFeed(mutation.target)) continue;
+        if (isInsideChat(mutation.target)) continue;
         tryLogPurchaseFromText(text.trim(), mutation.target);
         continue;
       }
@@ -3557,6 +4342,7 @@ yasukuni sword|65|70|49|54
         const text = node.textContent;
         if (!text || !/you bought/i.test(text)) continue;
         if (isInsideHistoryFeed(node)) continue;
+        if (isInsideChat(node)) continue;
         tryLogPurchaseFromText(text.trim(), node);
       }
     }
@@ -4007,6 +4793,776 @@ yasukuni sword|65|70|49|54
       if (e.key === 'Escape') hideTaxPopover();
     });
   }
+
+  ////////////////////////////////////////////////////////////////////////////
+  ////  MARKET QUALITY OVERLAY (Item Market + Bazaar + Items page + Display Case)
+  ////////////////////////////////////////////////////////////////////////////
+  //
+  // Draws a "Q %" quality badge and the bonus percentages onto each weapon/armour
+  // listing so you can read the quality of what you are buying or holding at a
+  // glance. FLIPR's own card readers do the reading; the base-stat numbers and the
+  // quality formula are facts about the game, not code borrowed from anywhere.
+  //
+  // Quality is DERIVED, never fetched from an item-info API: Torn already renders
+  // each listing's damage/accuracy (or armour) on the tile, and a fixed 0%-quality
+  // base value per item is known, so quality is just how far above base this copy
+  // sits:
+  //     weapon: ((dmg - baseDmg) + (acc - baseAcc)) * 10
+  //     armour: (armour - baseArmour) * 20
+  //
+  // Data sources per page - both read-only, both adding ZERO API calls:
+  //   Bazaar      pure DOM. The item ID is in the tile's image URL; damage/
+  //               accuracy/armour and the bonuses are on the tile.
+  //   Item Market the newer React tiles carry no item ID, so the page's OWN
+  //               responses (the sid=iMarket calls Torn already makes) are read via
+  //               a pass-through fetch wrapper into an in-memory cache of
+  //               {id, price, stats, bonuses}, and each tile is matched to it by
+  //               price + stats. That cache is EPHEMERAL - never written to storage,
+  //               never reused for anything else, capped in size, gone on reload -
+  //               which is the boundary Torn staff confirmed is acceptable. The
+  //               wrapper only observes; it never blocks or alters a response.
+  //
+  // If another quality-overlay script has already tagged a listing (a known marker
+  // class), FLIPR steps aside on that tile so the two never draw over each other.
+
+  // Base (0%-quality) Damage per item ID. Torn's own values (facts); keep in step
+  // with the game as new weapons ship or their listings simply show no badge.
+  const MQ_BASE_DAMAGE = {
+    1: 17, 2: 16, 3: 20, 4: 11, 5: 21, 6: 25, 7: 28, 8: 34, 9: 40, 10: 61,
+    11: 58, 12: 28, 13: 29, 14: 32, 15: 36, 16: 44, 17: 48, 18: 52, 19: 55, 20: 59,
+    21: 64, 22: 41, 23: 39, 24: 45, 25: 48, 26: 56, 27: 55, 28: 59, 29: 61, 30: 64,
+    31: 67, 63: 72, 76: 52, 98: 59, 99: 33, 100: 64, 108: 65, 109: 77, 110: 27, 111: 39,
+    146: 65, 147: 22, 170: 60, 173: 24, 174: 50, 175: 1, 177: 61, 189: 42, 217: 57, 218: 35,
+    219: 63, 223: 69, 224: 23, 225: 56, 227: 38, 228: 50, 230: 18, 231: 60, 232: 62, 233: 61,
+    234: 31, 235: 22, 236: 35, 237: 62, 238: 29, 240: 78, 241: 50, 243: 30, 244: 15, 245: 13,
+    247: 52, 248: 62, 249: 46, 250: 50, 251: 53, 252: 49, 253: 27, 254: 47, 255: 67, 289: 70,
+    290: 70, 291: 70, 292: 70, 346: 40, 359: 16, 360: 53, 382: 75, 387: 67, 388: 74, 391: 57,
+    393: 14, 395: 61, 397: 71, 398: 69, 399: 68, 400: 63, 401: 26, 402: 51, 438: 18, 439: 19,
+    440: 1, 483: 42, 484: 46, 485: 40, 486: 38, 487: 39, 488: 37, 489: 35, 490: 46, 539: 36,
+    545: 79, 546: 76, 547: 78, 548: 77, 549: 80, 599: 60, 600: 61, 604: 43, 605: 45, 612: 65,
+    613: 47, 614: 60, 615: 64, 632: 48, 790: 5, 792: 17, 805: 18, 830: 95, 831: 54, 832: 21,
+    837: 66, 838: 63, 839: 60, 844: 15, 845: 58, 846: 56, 850: 58, 871: 5, 874: 68, 1053: 41,
+    1055: 35, 1056: 40, 1152: 76, 1153: 74, 1154: 73, 1155: 70, 1156: 68, 1157: 69, 1158: 62,
+    1159: 51, 1173: 37, 1231: 29, 1255: 54, 1257: 1, 1296: 27
+  };
+  const MQ_BASE_ACCURACY = {
+    1: 55, 2: 57, 3: 52, 4: 62, 5: 45, 6: 55, 7: 60, 8: 52, 9: 58, 10: 23,
+    11: 52, 12: 53, 13: 52, 14: 56, 15: 54, 16: 58, 17: 51, 18: 49, 19: 38, 20: 36,
+    21: 30, 22: 63, 23: 65, 24: 51, 25: 51, 26: 52, 27: 47, 28: 55, 29: 47, 30: 45,
+    31: 41, 63: 28, 76: 24, 98: 24, 99: 57, 100: 24, 108: 43, 109: 39, 110: 52, 111: 51,
+    146: 49, 147: 15, 170: 24, 173: 55, 174: 56, 175: 54, 177: 53, 189: 54, 217: 49, 218: 63,
+    219: 55, 223: 52, 224: 52, 225: 62, 227: 48, 228: 48, 230: 22, 231: 46, 232: 50, 233: 55,
+    234: 52, 235: 59, 236: 55, 237: 56, 238: 52, 240: 25, 241: 57, 243: 57, 244: 39, 245: 55,
+    247: 55, 248: 53, 249: 47, 250: 53, 251: 51, 252: 62, 253: 41, 254: 52, 255: 39, 289: 54,
+    290: 54, 291: 54, 292: 54, 346: 63, 359: 50, 360: 57, 382: 62, 387: 63, 388: 45, 391: 65,
+    393: 54, 395: 60, 397: 28, 398: 50, 399: 57, 400: 35, 401: 33, 402: 60, 438: 42, 439: 43,
+    440: 63, 483: 52, 484: 41, 485: 54, 486: 45, 487: 43, 488: 41, 489: 48, 490: 24, 539: 55,
+    545: 38, 546: 47, 547: 46, 548: 45, 549: 36, 599: 48, 600: 41, 604: 45, 605: 48, 612: 52,
+    613: 63, 614: 62, 615: 52, 632: 48, 790: 29, 792: 57, 805: 55, 830: 45, 831: 53, 832: 54,
+    837: 36, 838: 60, 839: 45, 844: 45, 845: 53, 846: 52, 850: 50, 871: 59, 874: 57, 1053: 65,
+    1055: 49, 1056: 47, 1152: 42, 1153: 44, 1154: 40, 1155: 45, 1156: 36, 1157: 49, 1158: 39,
+    1159: 56, 1173: 67, 1231: 59, 1255: 52, 1257: 59, 1296: 58
+  };
+  const MQ_BASE_ARMOUR = {
+    32: 20, 33: 32, 34: 34, 49: 31, 50: 36, 176: 23, 178: 30, 332: 38, 333: 40, 334: 42,
+    348: 10, 538: 25, 640: 32, 641: 34, 642: 30, 643: 30, 644: 34, 645: 30, 646: 24, 647: 20,
+    648: 20, 649: 20, 650: 20, 651: 38, 652: 38, 653: 38, 654: 38, 655: 35, 656: 45, 657: 45,
+    658: 45, 659: 45, 660: 44, 661: 44, 662: 44, 663: 44, 664: 44, 665: 46, 666: 46, 667: 46,
+    668: 46, 669: 46, 670: 49, 671: 49, 672: 49, 673: 49, 674: 49, 675: 40, 676: 52, 677: 52,
+    678: 52, 679: 52, 680: 55, 681: 55, 682: 55, 683: 55, 684: 55, 848: 32, 1164: 38, 1165: 50,
+    1166: 50, 1167: 50, 1168: 50, 1174: 39, 1307: 53, 1308: 53, 1309: 53, 1310: 53, 1311: 53,
+    1355: 48, 1356: 48, 1357: 48, 1358: 48, 1359: 48
+  };
+
+  // Bonuses with a fixed effect and no percentage (shown as a bare name).
+  const MQ_FIXED_BONUSES = new Set(['Smash', 'Sleep', 'Storage']);
+  // Tier colours by how close to the top of its range the quality is (0-100%
+  // normalised): weak -> strong. Two palettes so the badge reads on either theme.
+  const MQ_TIER = {
+    dark: ['#e4e4e4', '#57efea', '#c286ff', '#ffd700'],
+    light: ['#717171', '#009590', '#8e19c1', '#e37100']
+  };
+  const MQ_CACHE_MAX = 1500;
+
+  const mqCache = [];            // ephemeral Item Market listings (see section header)
+  let mqProcessed = new WeakMap(); // tile -> last drawn signature, so a redraw is a no-op
+  let mqBazaarObserver = null;
+  let mqItemMarketObserver = null;
+  let mqInventoryObserver = null;
+  let mqDisplayCaseObserver = null;
+  let mqStarted = false;
+  let mqRaf = 0;
+
+  // Item Market quality filter (HIGHLIGHT-only, non-destructive): glow the tiles whose
+  // derived Q% is >= a minimum (and, optionally, that carry a named bonus). Torn's own
+  // filters cannot target our Q%, so this fills that gap; it only marks tiles, never
+  // hides or reorders them. State persists in localStorage.
+  const MQ_FILTER_KEY = 'flipr_mq_filter_v1';
+  let mqFilter = { on: false, minQ: 0, bonus: '' };
+  try { const s = JSON.parse(localStorage.getItem(MQ_FILTER_KEY) || 'null'); if (s && typeof s === 'object') mqFilter = { on: !!s.on, minQ: +s.minQ || 0, bonus: String(s.bonus || '') }; } catch (e) { /* defaults */ }
+  function mqSaveFilter() { try { localStorage.setItem(MQ_FILTER_KEY, JSON.stringify(mqFilter)); } catch (e) { /* ignore */ } }
+  function mqMatchesFilter(quality, bonuses) {
+    if (quality == null || quality < mqFilter.minQ) return false;
+    const want = mqFilter.bonus.trim().toLowerCase();
+    if (want && !(bonuses || []).some((b) => (b.name || '').toLowerCase().includes(want))) return false;
+    return true;
+  }
+
+  const mqIsBazaar = () => /\/bazaar\.php/i.test(location.pathname);
+  const mqIsInventory = () => /\/item\.php/i.test(location.pathname);
+  const mqIsDisplayCase = () => /\/displaycase\.php/i.test(location.pathname);
+  const mqIsArmoury = () => /\/factions\.php/i.test(location.pathname) && /tab=armoury/i.test(location.hash);
+
+  // Coalesce the flurry of observer callbacks (Torn redraws the whole grid on any
+  // scroll/filter) into one pass per frame. The signature gate below makes each
+  // pass idempotent, so our own badge inserts can't drive an infinite loop.
+  function mqSchedule() {
+    if (mqRaf) return;
+    mqRaf = requestAnimationFrame(() => { mqRaf = 0; try { mqProcessCurrent(); } catch (e) {} });
+  }
+
+  function mqBase(itemID) {
+    const id = String(itemID);
+    if (!(id in MQ_BASE_DAMAGE) && !(id in MQ_BASE_ACCURACY) && !(id in MQ_BASE_ARMOUR)) return null;
+    return { dmg: MQ_BASE_DAMAGE[id] || 0, acc: MQ_BASE_ACCURACY[id] || 0, armour: MQ_BASE_ARMOUR[id] || 0 };
+  }
+
+  // Quality as a number (percent), or null if the item isn't in the base tables.
+  function mqQuality(itemID, dmg, acc, armour) {
+    const base = mqBase(itemID);
+    if (!base) return null;
+    if (armour != null && armour > 0) return (armour - base.armour) * 20;
+    if (dmg == null && acc == null) return null;
+    return (((dmg || 0) - base.dmg) + ((acc || 0) - base.acc)) * 10;
+  }
+
+  const mqDark = () => !!(document.body && document.body.classList.contains('dark-mode'));
+
+  function mqTierColour(quality, maxRange) {
+    const norm = (Math.min(Math.max(quality, 0), maxRange) / maxRange) * 100;
+    const t = mqDark() ? MQ_TIER.dark : MQ_TIER.light;
+    if (norm <= 25) return t[0];
+    if (norm <= 50) return t[1];
+    if (norm <= 75) return t[2];
+    return t[3];
+  }
+
+  // Draw (or replace) the "Q %" pill over the tile's image.
+  function mqInjectBadge(imageWrapper, quality, maxRange) {
+    if (!imageWrapper) return;
+    const clamped = Math.min(Math.max(quality, 0), maxRange);
+    const old = imageWrapper.querySelector('.flipr-q-badge');
+    if (old) old.remove();
+    const dark = mqDark();
+    const badge = document.createElement('div');
+    badge.className = 'flipr-q-badge';
+    badge.textContent = 'Q ' + clamped.toFixed(1) + '%';
+    badge.style.cssText = 'position:absolute;top:2px;left:2px;padding:1px 3px;border-radius:3px;' +
+      'font-size:11px;font-weight:bold;z-index:5;pointer-events:none;line-height:1.2;' +
+      'background:' + (dark ? 'rgba(0,0,0,0.8)' : 'rgba(255,255,255,0.9)') + ';' +
+      'color:' + mqTierColour(quality, maxRange) + ';';
+    if (getComputedStyle(imageWrapper).position === 'static') imageWrapper.style.position = 'relative';
+    imageWrapper.appendChild(badge);
+  }
+
+  // Draw (or replace) the bonuses under the item's name as compact FLIPR-purple
+  // pills - a distinct, at-a-glance row rather than a plain text list.
+  function mqInjectBonuses(titleEl, bonuses, insertBeforeEl, inline) {
+    if (!titleEl) return;
+    const old = titleEl.querySelector('.flipr-mq-bonuses');
+    if (old) old.remove();
+    if (!bonuses || !bonuses.length) return;
+    const dark = mqDark();
+    const box = document.createElement('div');
+    box.className = 'flipr-mq-bonuses';
+    // inline mode (compact "Your items" list rows): sit to the RIGHT of the name
+    // text instead of a block below it, which in a fixed-height row overflows and
+    // overlaps the next row. Grid/market layouts use the block-below default.
+    box.style.cssText = inline
+      ? 'display:inline-flex;flex-wrap:wrap;gap:3px;margin-left:6px;vertical-align:middle;'
+      : 'display:flex;flex-wrap:wrap;gap:3px;margin-top:2px;';
+    for (const b of bonuses) {
+      const pill = document.createElement('span');
+      pill.style.cssText = 'display:inline-block;padding:1px 6px;border-radius:9px;' +
+        'font-size:10px;font-weight:600;line-height:1.4;white-space:nowrap;' +
+        'background:' + (dark ? 'rgba(150,90,220,0.22)' : 'rgba(120,40,180,0.1)') + ';' +
+        'color:' + (dark ? '#e8d1ff' : '#5b1785') + ';' +
+        'border:1px solid ' + (dark ? 'rgba(180,130,240,0.35)' : 'rgba(120,40,180,0.25)') + ';';
+      if (MQ_FIXED_BONUSES.has(b.name)) pill.textContent = b.name;
+      else if (b.value != null && b.value !== '') pill.textContent = b.name + ' ' + b.value + (b.pct ? '%' : '');
+      else pill.textContent = b.name;
+      box.appendChild(pill);
+    }
+    if (insertBeforeEl && insertBeforeEl.parentNode === titleEl) titleEl.insertBefore(box, insertBeforeEl);
+    else titleEl.appendChild(box);
+  }
+
+  // Bazaar bonus icons carry the name/description in data attributes; the title can
+  // be a little HTML (<b>Name</b>...). Stat icons (damage/accuracy/armour) live in a
+  // different group but are excluded here defensively.
+  function mqReadBazaarBonuses(tile) {
+    const out = [];
+    const icons = tile.querySelectorAll('[class*="iconBonuses___"] i, i[data-bonus-attachment-title]');
+    for (const icon of icons) {
+      const cls = icon.getAttribute('class') || '';
+      if (/bonus-attachment-item-(damage|accuracy|armou?r|defen[cs]e)-bonus/i.test(cls)) continue;
+      const rawTitle = icon.getAttribute('data-bonus-attachment-title') || '';
+      const rawDesc = icon.getAttribute('data-bonus-attachment-description') || '';
+      if (!rawTitle && !rawDesc) continue;
+      const tmp = document.createElement('div');
+      tmp.innerHTML = rawTitle;
+      const bold = tmp.querySelector('b');
+      const name = ((bold ? bold.textContent : tmp.textContent) || '').trim();
+      if (!name) continue;
+      const descText = ((tmp.textContent || '').replace(name, '').trim()) || rawDesc;
+      const num = descText.match(/(\d+(?:\.\d+)?)/);
+      const value = num ? num[1] : null;
+      const pct = value != null && new RegExp(value.replace('.', '\\.') + '\\s*%').test(descText);
+      out.push({ name, value, pct });
+    }
+    return out;
+  }
+
+  // Item Market bonuses come from the cached listing (shape is best-effort: read a
+  // name and, if present, a percentage). The quality badge does not depend on this.
+  function mqApiBonuses(arr) {
+    if (!Array.isArray(arr)) return [];
+    const out = [];
+    for (const b of arr) {
+      if (!b) continue;
+      const name = String(b.title || b.type || b.name || '').trim();
+      if (!name) continue;
+      const value = (b.value != null && b.value !== '') ? b.value : null;
+      const desc = String(b.description || '');
+      const pct = value != null && new RegExp(String(value).replace('.', '\\.') + '\\s*%').test(desc);
+      out.push({ name, value, pct });
+    }
+    return out;
+  }
+
+  const mqRound2 = (n) => (n == null ? null : Math.round(n * 100) / 100);
+
+  function mqPlausible(quality, maxRange) {
+    // A wrong cache match or a mis-read shows up as a wildly out-of-band number;
+    // clamp the display but refuse to draw an obviously nonsense badge.
+    return quality > -60 && quality < maxRange + 120;
+  }
+
+  // ---- Bazaar (pure DOM) --------------------------------------------------
+  function mqProcessBazaar() {
+    const tiles = document.querySelectorAll('#bazaarRoot [class*="item___"]');
+    for (const tile of tiles) {
+      if (tile.querySelector('.openmarket-quality-box')) continue; // another quality script already tagged this tile
+      const img = tile.querySelector('[class*="imgContainer___"] img');
+      if (!img) continue;
+      const m = (img.src || '').match(/\/images\/items\/(\d+)\//);
+      if (!m || !mqBase(m[1])) continue;
+      const itemID = m[1];
+      const stats = readCardStats(tile);
+      if (!stats) continue;
+      const quality = mqQuality(itemID, stats.dmg, stats.acc, stats.armor);
+      if (quality == null) continue;
+      const maxRange = (stats.armor != null && stats.armor > 0) ? 100 : 300;
+      if (!mqPlausible(quality, maxRange)) continue;
+      const bonuses = mqReadBazaarBonuses(tile);
+      const sig = itemID + '|' + stats.dmg + '|' + stats.acc + '|' + stats.armor + '|' +
+        bonuses.map((b) => b.name + b.value).join(',');
+      if (mqProcessed.get(tile) === sig) continue;
+      const imageWrapper = tile.querySelector('[class*="imgBar___"]') || img.parentElement;
+      const titleEl = tile.querySelector('[class*="description___"]');
+      const stockEl = titleEl ? titleEl.querySelector('[class*="amount___"]') : null;
+      mqInjectBadge(imageWrapper, quality, maxRange);
+      mqInjectBonuses(titleEl, bonuses, stockEl);
+      mqProcessed.set(tile, sig);
+    }
+  }
+
+  function mqInitBazaar() {
+    mqWaitFor('#bazaarRoot', (root) => {
+      mqSchedule();
+      const obs = new MutationObserver(() => mqSchedule());
+      obs.observe(root, { childList: true, subtree: true });
+      mqBazaarObserver = obs;
+    });
+  }
+
+  // ---- Item Market (fetch cache + tile matching) --------------------------
+  function mqPushCache(items) {
+    const seen = new Set(mqCache.map((i) => i.listingID));
+    for (const it of items) if (it && !seen.has(it.listingID)) mqCache.push(it);
+    if (mqCache.length > MQ_CACHE_MAX) mqCache.splice(0, mqCache.length - MQ_CACHE_MAX);
+  }
+
+  function mqMatchCache(tile) {
+    const priceEl = tile.querySelector('[class*="priceAndTotal___"] span');
+    const price = priceEl ? parseInt((priceEl.textContent || '').replace(/[^\d]/g, ''), 10) : 0;
+    if (!price) return null;
+    const stats = readCardStats(tile) || { dmg: null, acc: null, armor: null };
+    const dmg = mqRound2(stats.dmg), acc = mqRound2(stats.acc), armor = mqRound2(stats.armor);
+    const hits = mqCache.filter((it) => {
+      if (it.minPrice !== price) return false;
+      if (it.armor && it.armor > 0) return mqRound2(it.armor) === armor;
+      return mqRound2(it.damage) === dmg && mqRound2(it.accuracy) === acc;
+    });
+    return hits.length === 1 ? hits[0] : null; // 0 or ambiguous: don't guess
+  }
+
+  // The Item Market list is a CSS grid with FIXED 115px rows (grid-template-rows:
+  // 115px 115px ...), so a second bonus pill - or a long name that wraps - grows
+  // past the 115px cell and bleeds into the card below. Let each row size to its
+  // OWN content instead - at least Torn's original 115px, taller only where the
+  // extra pill/name actually needs it - via one injected stylesheet that beats
+  // Torn's hashed class rules. Removed again when the overlay is switched off.
+  //
+  // We deliberately do NOT pin a fixed 140px row or force a tile min-height any more:
+  // that stretched every SHORT weapon tile (and the image Torn sizes to fill it) taller
+  // than its content, which is what mangled the weapon images. minmax(115px,auto) keeps
+  // the native look on normal tiles and only grows the ones that overflow.
+  function mqEnsureMarketGridStyle() {
+    if (document.getElementById('flipr-mq-grid')) return;
+    const st = document.createElement('style');
+    st.id = 'flipr-mq-grid';
+    // Two-underscore substring matches Torn's hashed classes (itemList__x /
+    // itemTile__x) whether the build uses two or three underscores. "itemList__"
+    // matches only the grid, not itemListWrapper__ (no "__" right after "itemList").
+    st.textContent =
+      '[class*="itemList__"]{grid-template-rows:none !important;grid-auto-rows:minmax(115px,auto) !important;}';
+    (document.head || document.documentElement).appendChild(st);
+  }
+
+  function mqProcessItemMarket() {
+    // Root id can drift; fall back to a document-wide tile query so a renamed
+    // container never silently kills the overlay.
+    let tiles = document.querySelectorAll('#item-market-root [class*="itemTile___"]');
+    if (!tiles.length) tiles = document.querySelectorAll('[class*="itemTile___"]');
+    let drew = 0; // weapon/armour tiles on this page (categories like energy drinks have none)
+    for (const tile of tiles) {
+      if (tile.querySelector('.openmarket-quality-box')) continue; // another quality script already tagged this tile
+
+      // Preferred path: read the item ID straight from the tile image, exactly
+      // like the Bazaar. No fetch, no cache, no cross-context anything - so when
+      // it works it is the most reliable and most compliant route.
+      let itemID = null, dmg = null, acc = null, armour = null, bonuses = [], listingSig = '';
+      const img = tile.querySelector('img');
+      const m = img && (img.src || '').match(/\/images\/items\/(\d+)\//);
+      if (m && mqBase(m[1])) {
+        const stats = readCardStats(tile);
+        if (!stats) continue;
+        itemID = m[1];
+        dmg = stats.dmg; acc = stats.acc; armour = stats.armor;
+        bonuses = mqReadBazaarBonuses(tile);
+      } else {
+        // Fallback: the ID is not in the DOM, so match the tile to a listing we
+        // observed Torn fetch (ephemeral cache - see the fetch wrapper below).
+        if (!mqCache.length) continue;
+        const cached = mqMatchCache(tile);
+        if (!cached || !mqBase(cached.itemID)) continue;
+        itemID = cached.itemID;
+        dmg = cached.damage || null; acc = cached.accuracy || null; armour = cached.armor || null;
+        bonuses = mqApiBonuses(cached.bonuses);
+        listingSig = '|' + cached.listingID;
+      }
+
+      const quality = mqQuality(itemID, dmg, acc, armour);
+      if (quality == null) continue;
+      const maxRange = (armour != null && armour > 0) ? 100 : 300;
+      if (!mqPlausible(quality, maxRange)) continue;
+      drew++; // a weapon/armour tile we own the overlay for (counted even if the redraw is a no-op)
+      const filterSig = mqFilter.on ? ('|F' + mqFilter.minQ + ':' + mqFilter.bonus) : '';
+      const sig = itemID + listingSig + '|' + dmg + '|' + acc + '|' + armour + '|' +
+        bonuses.map((b) => b.name + b.value).join(',') + filterSig;
+      if (mqProcessed.get(tile) === sig) continue;
+      const imageWrapper = tile.querySelector('[class*="tileImage___"]') || (img && img.parentElement);
+      const titleEl = tile.querySelector('div > [class*="title___"]') || tile.querySelector('[class*="title___"]');
+      mqInjectBadge(imageWrapper, quality, maxRange);
+      mqInjectBonuses(titleEl, bonuses, null);
+      tile.classList.toggle('flipr-mq-match', mqFilter.on && mqMatchesFilter(quality, bonuses)); // highlight-only filter
+      mqProcessed.set(tile, sig);
+    }
+    // Only reshape the grid and show the filter when this category actually has
+    // weapons/armour. On energy drinks / other non-gear categories we draw nothing,
+    // so leave Torn's native layout alone (the 140px override mangled small tiles).
+    if (drew) { mqEnsureMarketGridStyle(); mqEnsureFilterStyle(); mqEnsureFilterBar(); }
+    else {
+      const gs = document.getElementById('flipr-mq-grid');
+      if (gs) gs.remove();
+      mqRemoveFilterBar();
+    }
+  }
+
+  // ---- Item Market quality filter (highlight-only) ------------------------
+  function mqEnsureFilterStyle() {
+    if (document.getElementById('flipr-mq-filter-style')) return;
+    const st = document.createElement('style');
+    st.id = 'flipr-mq-filter-style';
+    st.textContent =
+      '.flipr-mq-match{outline:2px solid #b06bf0 !important;outline-offset:-2px !important;' +
+      'box-shadow:0 0 12px rgba(176,107,240,0.75) !important;border-radius:5px;}' +
+      '#flipr-mq-filter{position:fixed;left:50%;bottom:10px;transform:translateX(-50%);z-index:99998;' +
+      'display:flex;align-items:center;gap:7px;padding:6px 10px;border-radius:9px;font:600 12px/1.3 inherit;' +
+      'background:rgba(20,16,28,0.96);color:#e8d1ff;border:1px solid rgba(180,130,240,0.45);' +
+      'box-shadow:0 3px 12px rgba(0,0,0,0.55);}' +
+      '#flipr-mq-filter input[type=number]{width:46px;}#flipr-mq-filter input[type=text]{width:96px;}' +
+      '#flipr-mq-filter input{background:rgba(255,255,255,0.06);color:#f2e8ff;border:1px solid rgba(180,130,240,0.4);' +
+      'border-radius:5px;padding:2px 5px;font:inherit;}' +
+      '#flipr-mq-filter label{display:flex;align-items:center;gap:4px;white-space:nowrap;}' +
+      '#flipr-mq-filter .flipr-mq-x{cursor:pointer;opacity:0.7;padding:0 2px;}#flipr-mq-filter .flipr-mq-x:hover{opacity:1;}';
+    (document.head || document.documentElement).appendChild(st);
+  }
+
+  function mqRemoveFilterBar() {
+    const b = document.getElementById('flipr-mq-filter');
+    if (b) b.remove();
+  }
+
+  // A small fixed control (bottom centre) for the Item Market only. Highlights tiles
+  // whose derived Q% is >= "Q>=" and (if set) that carry the named bonus. Non-
+  // destructive: it never hides or reorders, just glows the matches.
+  function mqEnsureFilterBar() {
+    if (document.getElementById('flipr-mq-filter')) return;
+    const bar = document.createElement('div');
+    bar.id = 'flipr-mq-filter';
+    const tag = document.createElement('span'); tag.textContent = 'FLIPR filter'; tag.style.cssText = 'font-weight:800;letter-spacing:0.2px;';
+    const onWrap = document.createElement('label');
+    const onBox = document.createElement('input'); onBox.type = 'checkbox'; onBox.checked = mqFilter.on;
+    onWrap.appendChild(onBox); onWrap.appendChild(document.createTextNode('on'));
+    const qWrap = document.createElement('label'); qWrap.appendChild(document.createTextNode('Q>='));
+    const qIn = document.createElement('input'); qIn.type = 'number'; qIn.step = '1'; qIn.value = String(mqFilter.minQ); qWrap.appendChild(qIn);
+    const bWrap = document.createElement('label'); bWrap.appendChild(document.createTextNode('bonus'));
+    const bIn = document.createElement('input'); bIn.type = 'text'; bIn.placeholder = 'any'; bIn.value = mqFilter.bonus; bWrap.appendChild(bIn);
+    const x = document.createElement('span'); x.className = 'flipr-mq-x'; x.textContent = 'x'; x.title = 'Hide this bar (turns the filter off)';
+    const sync = () => { mqFilter.on = onBox.checked; mqFilter.minQ = +qIn.value || 0; mqFilter.bonus = bIn.value || ''; mqSaveFilter(); mqSchedule(); };
+    onBox.addEventListener('change', sync);
+    qIn.addEventListener('input', sync);
+    bIn.addEventListener('input', sync);
+    x.addEventListener('click', () => { mqFilter.on = false; mqSaveFilter(); document.querySelectorAll('.flipr-mq-match').forEach((el) => el.classList.remove('flipr-mq-match')); mqRemoveFilterBar(); });
+    bar.appendChild(tag); bar.appendChild(onWrap); bar.appendChild(qWrap); bar.appendChild(bWrap); bar.appendChild(x);
+    (document.body || document.documentElement).appendChild(bar);
+  }
+
+  // Pass-through wrapper on the page's own fetch: it reads the Item Market listing
+  // responses Torn already requests and does nothing else - never blocks, never
+  // alters, never issues a request of its own. Guarded so it installs at most once.
+  function mqInstallFetchHook() {
+    // FLIPR runs in the userscript sandbox (it uses GM_* storage), so plain
+    // window.fetch here is the sandbox's copy, NOT the fetch Torn's page calls -
+    // wrapping it would observe nothing. unsafeWindow is the real page window, so
+    // its fetch is the one Torn's Item Market actually uses. Fall back to window
+    // for engines (e.g. Torn PDA) that run us in the page and expose no
+    // unsafeWindow; both cases are guarded so nothing ever throws.
+    let pageWin;
+    try { pageWin = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window; }
+    catch (e) { pageWin = window; }
+    if (!pageWin || pageWin.__fliprMqFetchHooked) return;
+    const original = pageWin.fetch;
+    if (typeof original !== 'function') return;
+    pageWin.__fliprMqFetchHooked = true;
+    pageWin.fetch = function (...args) {
+      const out = original.apply(this, args);
+      try {
+        const a0 = args[0];
+        const url = (a0 && typeof a0 === 'object' && a0.url) ? String(a0.url) : String(a0 || '');
+        if (/sid=iMarket/i.test(url) && out && typeof out.then === 'function') {
+          out.then((resp) => {
+            try {
+              resp.clone().json().then((data) => {
+                if (data && Array.isArray(data.items) && data.items.length) {
+                  mqPushCache(data.items);
+                  mqSchedule();
+                }
+              }).catch(() => {});
+            } catch (e) { /* cross-context read refused: DOM path still covers it */ }
+          }).catch(() => {});
+        }
+      } catch (e) { /* never let our observation break the page's fetch */ }
+      return out;
+    };
+  }
+
+  function mqInitItemMarket() {
+    mqInstallFetchHook();
+    mqWaitFor('#item-market-root', (root) => {
+      mqSchedule();
+      const obs = new MutationObserver(() => mqSchedule());
+      obs.observe(root, { childList: true, subtree: true });
+      mqItemMarketObserver = obs;
+    });
+  }
+
+  // ---- Items page / inventory (pure DOM) ----------------------------------
+  // item.php lists each owned weapon/armour as an <li data-item="ID"> whose
+  // damage/accuracy (or armour) sit in an inline .bonuses-wrap - the SAME
+  // bonus-attachment icon markup the bazaar uses - so readCardStats reads it with
+  // no expansion and no API call. The item ID is right on the tile (data-item),
+  // so quality is derived exactly like the bazaar. Empty bonus slots render as
+  // bonus-attachment-blank-* icons and are skipped; a real weapon bonus (Poison
+  // etc.) carries its own icon + value span, read best-effort below.
+  // The intrinsic weapon bonus (Poison, Slow, ...) is the icon carrying a
+  // non-empty data-bonusid; empty slots have data-bonusid="", the damage/accuracy
+  // stat icons carry none (they use a value <span> instead, read as quality), and
+  // the player's attached mods (Reflex Sight etc.) are a different group without a
+  // bonusid - so this cleanly reads the weapon bonus and nothing else. The tooltip
+  // name/effect lives ENTITY-ENCODED in the icon's title ("&lt;b&gt;Slow&lt;/b&gt;
+  // &lt;br&gt;25% chance to ..."), so it is decoded once, then the bold is the
+  // name and the first percentage in the rest is the value (e.g. Poison: 96%).
+  function mqReadInventoryBonuses(tile) {
+    const out = [];
+    const wrap = tile.querySelector('.bonuses-wrap');
+    if (!wrap) return out;
+    const decode = (html) => { const ta = document.createElement('textarea'); ta.innerHTML = html || ''; return ta.value; };
+    for (const icon of wrap.querySelectorAll('i[data-bonusid]')) {
+      if (!icon.getAttribute('data-bonusid')) continue; // empty slot
+      const holder = document.createElement('div');
+      holder.innerHTML = decode(icon.getAttribute('title') || '');
+      const bold = holder.querySelector('b');
+      let name = ((bold ? bold.textContent : '') || '').trim();
+      if (!name) {
+        const nm = (icon.getAttribute('class') || '').match(/bonus-attachment-([a-z0-9-]+)/i);
+        if (nm && nm[1]) name = nm[1].replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+      }
+      if (!name) continue;
+      const desc = (holder.textContent || '').replace(name, '').trim();
+      const pm = desc.match(/(\d+(?:\.\d+)?)\s*%/);
+      out.push({ name, value: pm ? pm[1] : null, pct: !!pm });
+    }
+    return out;
+  }
+
+  function mqProcessInventory() {
+    const tiles = document.querySelectorAll('li[data-item]');
+    for (const tile of tiles) {
+      if (tile.querySelector('.openmarket-quality-box')) continue; // another quality script already tagged this tile
+      const itemID = tile.getAttribute('data-item');
+      if (!itemID || !mqBase(itemID)) continue; // only weapons/armour we have a base for
+      const stats = readCardStats(tile);
+      if (!stats) continue;
+      const quality = mqQuality(itemID, stats.dmg, stats.acc, stats.armor);
+      if (quality == null) continue;
+      const maxRange = (stats.armor != null && stats.armor > 0) ? 100 : 300;
+      if (!mqPlausible(quality, maxRange)) continue;
+      const bonuses = mqReadInventoryBonuses(tile);
+      const sig = itemID + '|' + stats.dmg + '|' + stats.acc + '|' + stats.armor + '|' +
+        bonuses.map((b) => b.name + b.value).join(',');
+      if (mqProcessed.get(tile) === sig) continue;
+      const imageWrapper = tile.querySelector('.thumbnail') || tile.querySelector('.item-plate');
+      const nameWrap = tile.querySelector('.name-wrap') || tile.querySelector('.title');
+      mqInjectBadge(imageWrapper, quality, maxRange);
+      mqInjectBonuses(nameWrap, bonuses, null, true); // inline: right of the name in the compact list
+      mqProcessed.set(tile, sig);
+    }
+  }
+
+  // ---- Display case (pure DOM) --------------------------------------------
+  // displaycase.php is CLASSIC (not React). Each grid tile is:
+  //   li.torn-divider
+  //     div.b-item-name  > span "Leather Vest"          <- name (SIBLING of the wrap)
+  //     div.b-item-wrap                                 <- the tile we scan
+  //       span.item-plate > img.torn-item               <- image
+  //       div.item-hover[itemid="32"]                   <- item ID lives here
+  //       div.item-bonuses
+  //         div.iconbonuses   (the weapon bonus attachment, e.g. Shock)
+  //         div.infobonuses   (the stat icons: damage/accuracy or defence + value)
+  // So the ID comes off .item-hover[itemid], the stats are read by readCardStats from
+  // .infobonuses' bonus-attachment icons (same markup the bazaar uses), and the weapon
+  // bonus is read from .item-bonuses (skipping the stat icons). The badge goes into the
+  // .b-item-wrap itself (appended last, so it sits above the .item-hover overlay), and
+  // the pills go into the sibling .b-item-name via the parent <li>. Works on anyone's
+  // case you view, not just your own - no expansion, no API call.
+  function mqReadDisplayCaseBonuses(wrap) {
+    const out = [];
+    const box = wrap.querySelector('.item-bonuses') || wrap;
+    for (const span of box.querySelectorAll('span.bonus-attachment')) {
+      const icon = span.querySelector('i');
+      const cls = (icon && icon.getAttribute('class')) || '';
+      if (/bonus-attachment-item-(damage|accuracy|armou?r|defen[cs]e)-bonus/i.test(cls)) continue; // stat -> quality, not a bonus
+      if (/bonus-attachment-blank/i.test(cls)) continue; // empty slot
+      const rawTitle = span.getAttribute('title') || (icon && icon.getAttribute('title')) || '';
+      const holder = document.createElement('div');
+      holder.innerHTML = rawTitle; // display-case titles are real HTML (<b>Name</b><br>...)
+      const bold = holder.querySelector('b');
+      let name = ((bold ? bold.textContent : '') || '').trim();
+      if (!name) {
+        const nm = cls.match(/bonus-attachment-([a-z0-9-]+)/i);
+        if (nm && nm[1]) name = nm[1].replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+      }
+      if (!name) continue;
+      const desc = (holder.textContent || '').replace(name, '').trim();
+      const pm = desc.match(/(\d+(?:\.\d+)?)\s*%/);
+      out.push({ name, value: pm ? pm[1] : null, pct: !!pm });
+    }
+    return out;
+  }
+
+  function mqProcessDisplayCase() {
+    const wraps = document.querySelectorAll('.b-item-wrap');
+    for (const wrap of wraps) {
+      if (wrap.querySelector('.openmarket-quality-box')) continue; // another quality script already tagged this tile
+      const hover = wrap.querySelector('.item-hover[itemid]');
+      let itemID = hover ? hover.getAttribute('itemid') : null;
+      if (!itemID) {
+        const img = wrap.querySelector('img[src*="/images/items/"]');
+        if (img) { const m = (img.src || '').match(/\/images\/items\/(\d+)\//); itemID = m ? m[1] : null; }
+      }
+      if (!itemID || !mqBase(itemID)) continue; // only weapons/armour we have a base for
+      const stats = readCardStats(wrap);
+      if (!stats) continue;
+      const quality = mqQuality(itemID, stats.dmg, stats.acc, stats.armor);
+      if (quality == null) continue;
+      const maxRange = (stats.armor != null && stats.armor > 0) ? 100 : 300;
+      if (!mqPlausible(quality, maxRange)) continue;
+      const bonuses = mqReadDisplayCaseBonuses(wrap);
+      const sig = itemID + '|' + stats.dmg + '|' + stats.acc + '|' + stats.armor + '|' +
+        bonuses.map((b) => b.name + b.value).join(',');
+      if (mqProcessed.get(wrap) === sig) continue;
+      const li = wrap.closest('li');
+      const nameEl = (li && li.querySelector('.b-item-name')) || wrap.querySelector('.b-item-name');
+      mqInjectBadge(wrap, quality, maxRange); // into .b-item-wrap, above the .item-hover overlay
+      mqInjectBonuses(nameEl, bonuses, null, true); // inline: right of the name
+      mqProcessed.set(wrap, sig);
+    }
+  }
+
+  // ---- Faction Armory (pure DOM, AJAX/SPA tab) ----------------------------
+  // factions.php?step=your#/tab=armoury is a React tab (tiles hydrate late), so the
+  // body-scoped observer in mqStart re-runs this as the list renders. It has TWO layouts
+  // (a view toggle), both handled here:
+  //   LIST view:  ul.item-list > li
+  //     div.img-wrap[data-itemid="108"] > img.torn-item   <- image + item ID (attribute)
+  //     div.name.bold.t-overflow                          <- item name
+  //     ul.bonuses > li.left > i.bonus-attachment-item-damage-bonus + span   <- stat
+  //                                i.bonus-attachment-item-accuracy-bonus     <- stat
+  //                                i.bonus-attachment-<name>[title]           <- weapon bonus
+  //   GRID view:  ul.items-cont > li
+  //     div.thumbnail-wrap > div.thumbnail > div.image-wrap > img[src=/images/items/26/..] <- id in src
+  //     div.title-wrap > div.name-wrap.bold ... .t-overflow                   <- item name
+  //     ul.bonuses-wrap > li > i.bonus-attachment-item-(damage|accuracy|defence)-bonus + span
+  // The stat icons use the SAME bonus-attachment markup as the bazaar (incl. "defence" for
+  // armour), so readCardStats reads either ul unchanged and quality is derived like
+  // elsewhere. The id comes from .img-wrap[data-itemid] when present, else the image src.
+  // Badge goes on the image wrapper (.img-wrap or .thumbnail), pills next to the name
+  // (.name or .name-wrap). Only items we have a base for are tagged, so medical/drug/
+  // booster/temporary rows skip.
+  function mqReadArmouryBonuses(li) {
+    const out = [];
+    const box = li.querySelector('ul.bonuses-wrap') || li.querySelector('ul.bonuses') || li;
+    for (const icon of box.querySelectorAll('i[class*="bonus-attachment-"]')) {
+      const cls = icon.getAttribute('class') || '';
+      if (/bonus-attachment-item-(damage|accuracy|armou?r|defen[cs]e)-bonus/i.test(cls)) continue; // stat -> quality, not a bonus
+      if (/bonus-attachment-blank/i.test(cls)) continue; // empty slot
+      const holder = document.createElement('div');
+      holder.innerHTML = icon.getAttribute('title') || ''; // armoury titles are real HTML (<b>Quicken</b><br>...)
+      const bold = holder.querySelector('b');
+      let name = ((bold ? bold.textContent : '') || '').trim();
+      if (!name) {
+        const nm = cls.match(/bonus-attachment-([a-z0-9-]+)/i);
+        if (nm && nm[1]) name = nm[1].replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+      }
+      if (!name) continue;
+      const desc = (holder.textContent || '').replace(name, '').trim();
+      const pm = desc.match(/(\d+(?:\.\d+)?)\s*%/);
+      out.push({ name, value: pm ? pm[1] : null, pct: !!pm });
+    }
+    return out;
+  }
+
+  function mqProcessArmoury() {
+    // The armoury has two layouts depending on the view toggle: a LIST view
+    // (ul.item-list > li, id on .img-wrap[data-itemid], stats in ul.bonuses, name in
+    // .name, image in .img-wrap) and a GRID/tile view (ul.items-cont > li, no
+    // data-itemid so the id is read from the image src, stats in ul.bonuses-wrap, name
+    // in .name-wrap, image in .thumbnail). Handle both from one pass.
+    const tiles = document.querySelectorAll('ul.item-list > li, ul.items-cont li');
+    for (const tile of tiles) {
+      if (tile.querySelector('.openmarket-quality-box')) continue; // another quality script already tagged this tile
+      const wrap = tile.querySelector('.img-wrap[data-itemid]');
+      let itemID = wrap ? wrap.getAttribute('data-itemid') : null;
+      if (!itemID) {
+        const img = tile.querySelector('img[src*="/images/items/"]');
+        if (img) { const m = (img.getAttribute('src') || '').match(/\/images\/items\/(\d+)\//); itemID = m ? m[1] : null; }
+      }
+      if (!itemID || !mqBase(itemID)) continue; // only weapons/armour we have a base for
+      const stats = readCardStats(tile);
+      if (!stats) continue;
+      const quality = mqQuality(itemID, stats.dmg, stats.acc, stats.armor);
+      if (quality == null) continue;
+      const maxRange = (stats.armor != null && stats.armor > 0) ? 100 : 300;
+      if (!mqPlausible(quality, maxRange)) continue;
+      const bonuses = mqReadArmouryBonuses(tile);
+      const sig = itemID + '|' + stats.dmg + '|' + stats.acc + '|' + stats.armor + '|' +
+        bonuses.map((b) => b.name + b.value).join(',');
+      if (mqProcessed.get(tile) === sig) continue;
+      const imageWrapper = wrap || tile.querySelector('.img-wrap') ||
+        tile.querySelector('.thumbnail') || tile.querySelector('.thumbnail-wrap .image-wrap');
+      const nameEl = tile.querySelector('.name-wrap') || tile.querySelector('.name');
+      if (!imageWrapper || !nameEl) continue;
+      mqInjectBadge(imageWrapper, quality, maxRange);
+      mqInjectBonuses(nameEl, bonuses, null, true); // inline: right of the name
+      mqProcessed.set(tile, sig);
+    }
+  }
+
+  // ---- shared lifecycle ---------------------------------------------------
+  function mqWaitFor(sel, cb, tries) {
+    tries = tries == null ? 40 : tries;
+    const el = document.querySelector(sel);
+    if (el) { cb(el); return; }
+    if (tries <= 0) return;
+    setTimeout(() => mqWaitFor(sel, cb, tries - 1), 300);
+  }
+
+  function mqProcessCurrent() {
+    if (!settings.marketQuality) return;
+    if (!isItemMarketPage()) mqRemoveFilterBar(); // filter UI is Item Market only
+    if (isItemMarketPage()) mqProcessItemMarket();
+    else if (mqIsBazaar()) mqProcessBazaar();
+    else if (mqIsInventory()) mqProcessInventory();
+    else if (mqIsDisplayCase()) mqProcessDisplayCase();
+    else if (mqIsArmoury()) mqProcessArmoury();
+  }
+
+  function mqClearOverlay() {
+    document.querySelectorAll('.flipr-q-badge, .flipr-mq-bonuses').forEach((el) => el.remove());
+    document.querySelectorAll('.flipr-mq-match').forEach((el) => el.classList.remove('flipr-mq-match'));
+    mqRemoveFilterBar();
+    const gs = document.getElementById('flipr-mq-grid');
+    if (gs) gs.remove(); // restore Torn's native row height
+    mqProcessed = new WeakMap();
+  }
+
+  // Toggled live from Settings and by a cross-tab settings change.
+  function applyMarketQuality() {
+    if (settings.marketQuality) { mqProcessed = new WeakMap(); mqSchedule(); }
+    else mqClearOverlay();
+  }
+
+  // Wire the overlay ONCE, page-agnostically. This script runs a single time, but
+  // Torn navigates its sidebar via the History API (pushState) WITHOUT re-running any
+  // userscript, so a per-page, one-shot init left every page you reached through the
+  // menu (classically the Display Case) with no observer at all - it simply never ran.
+  // Instead: install the Item Market fetch hook (harmless elsewhere), attach ONE
+  // persistent body-scoped observer, and redraw on every client-side navigation.
+  // mqProcessCurrent re-checks the URL each run and every processor queries the whole
+  // document, so this one wiring covers Item Market, Bazaar, Items page and Display
+  // Case alike - and keeps working after any SPA navigation. Drawing stays gated on
+  // settings.marketQuality inside mqProcessCurrent, so the toggle still turns it off.
+  function mqStart() {
+    if (mqStarted) return;
+    mqStarted = true;
+    try { mqInstallFetchHook(); } catch (e) { /* only the Item Market cache fallback needs it */ }
+    const obs = new MutationObserver(() => mqSchedule());
+    obs.observe(document.body || document.documentElement, { childList: true, subtree: true });
+    mqInventoryObserver = obs;
+    window.addEventListener('hashchange', mqSchedule);
+    window.addEventListener('popstate', mqSchedule);
+    try {
+      const wrap = (orig) => function () { const r = orig.apply(this, arguments); try { mqSchedule(); } catch (e) { /* ignore */ } return r; };
+      history.pushState = wrap(history.pushState);
+      history.replaceState = wrap(history.replaceState);
+    } catch (e) { /* history not writable - the observer still covers most cases */ }
+    mqSchedule();
+  }
+
+  mqStart();
 
   log('FLIPR ready, version', SCRIPT_VERSION);
 })();
