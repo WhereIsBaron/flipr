@@ -4,6 +4,12 @@ Patch notes for FLIPR, a bazaar-flip profit tracker userscript for Torn. Created
 
 ---
 
+## v2.44.0
+- **New: optional cloud sync - your FLIPR data can now follow you between devices.** Turn it on under Settings → Cloud sync (off by default, behind a one-time consent prompt) and FLIPR keeps your own tracked data - holdings, sales, points, the "already counted" ledgers and your settings - mirrored to a private cloud store, then pulls it back on any other device where you switch it on. It's how your PDA and your desktop can finally show the same numbers without exporting and re-importing by hand.
+- **Your data stays yours.** The sync is tied to your own verified Torn ID, so you can only ever read or write your own snapshot - nobody else can see it and you can't see theirs. **Your API key is never uploaded** (it stays on each device, exactly as before), and turning cloud sync back off **deletes your cloud copy**. Still read-only toward Torn: sync only moves FLIPR's own numbers between your devices, it never touches the game.
+- **Note - which device wins.** For now sync is "newest save wins": whichever device saved last is the one that gets mirrored out. If you edit on two devices *between* syncs (say your phone while offline, then your desktop), the one that syncs later overwrites the other's un-synced edits. In normal one-device-at-a-time use you won't notice this; a smarter per-row merge is the planned follow-up.
+- **Note:** the on/off switch is deliberately per-device - adopting another device's data never silently turns sync on for a device that never agreed to it.
+
 ## v2.4.2
 - **Fix (PDA):** on Torn PDA, extra "F" buttons could stack up under the original as you moved around the game - one more each time you navigated (Crimes → Pick Pocket → back to hub → Burglary, and so on), only clearing on a full page refresh. PDA re-runs userscripts on each in-app navigation instead of doing a real page reload, so FLIPR was building a fresh panel on top of the live one every time. FLIPR now detects that its panel is already present and leaves it alone. Thanks to Skid_Br0 for the clear repro (Redmi K70, PDA 3.14.3).
 
