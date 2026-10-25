@@ -4,6 +4,10 @@ Patch notes for FLIPR, a bazaar-flip profit tracker userscript for Torn. Created
 
 ---
 
+## v2.45.1
+- **Diagnostics patch: a player-to-player trade that silently fell through now leaves a trace.** v2.45.0 could still miss the one case where a trade stops being tracked *before* FLIPR ever prices it - if Torn's trade page doesn't carry the trade id where FLIPR looks for it, the trade quietly dropped with nothing recorded at all. FLIPR now notes that it happened, which gate it stopped at, and the shape of the trade page's address (every number masked out), so a trade that "isn't tracked" can be diagnosed in one step instead of guessing. How FLIPR tracks your trades is unchanged.
+- **Same privacy bar as the rest of the diagnostics.** The address shape has every digit replaced with a placeholder before anything is saved, so no trade id or value is ever kept - it only shows the page's layout. Still diagnostics only, and your API key is still never uploaded.
+
 ## v2.45.0
 - **Diagnostics now travel with cloud sync, so a tracking problem can be fixed without asking you for anything.** FLIPR already kept a short "why wasn't this recorded?" trace for its debug export. That trace, plus running health counters and the last few caught errors, is now saved on your device and - if you use cloud sync - mirrored into your own private cloud copy. If your sells or trades ever stop being tracked, the exact gate they stop at is visible straight away, so the fix can follow with no back-and-forth. Nothing about how FLIPR tracks your buys and sells changes.
 - **Still diagnostics only, same privacy bar as the export.** What's stored is counters, short error messages, the per-trade trace (status labels, the trade's player names, a couple of layout hints) and whether you're on the PDA - never page contents, never money figures, and your API key is still never uploaded. If you don't use cloud sync, it simply stays on your device.

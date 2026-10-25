@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FLIPR: Flip Profit Tracker
 // @namespace    http://torn.city.com.dot.com.com
-// @version      2.45.0
+// @version      2.45.1
 // @description  Automatically logs what you paid for bazaar/item market purchases (via your own Torn API key) and warns you before you list them for less than a real profit, accounting for Torn's item market sales tax
 // @updateURL    https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
 // @downloadURL  https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
@@ -61,7 +61,7 @@
   ////////////////////////////////////////////////////////////////////////////
 
   const DEBUG = false;
-  const SCRIPT_VERSION = '2.45.0';
+  const SCRIPT_VERSION = '2.45.1';
 
   const STORAGE_KEY = 'flipr_lots_v1';
   const SETTINGS_KEY = 'flipr_settings_v1';
@@ -243,7 +243,7 @@
   // must never be the thing that breaks a caller.
   const Diag = (() => {
     const scrub = (s) => String(s == null ? '' : s).replace(/[A-Za-z0-9_-]{16,}/g, '***');
-    const empty = () => ({ v: 1, scriptVersion: SCRIPT_VERSION, updatedAt: 0, env: {}, counters: {}, tradeAttempts: [], errors: [] });
+    const empty = () => ({ v: 1, scriptVersion: SCRIPT_VERSION, updatedAt: 0, env: {}, counters: {}, tradeAttempts: [], errors: [], notes: {} });
     let data = null, saveTimer = null;
     function load() {
       if (data) return data;
@@ -252,6 +252,7 @@
       data.counters = (data.counters && typeof data.counters === 'object') ? data.counters : {};
       data.tradeAttempts = Array.isArray(data.tradeAttempts) ? data.tradeAttempts : [];
       data.errors = Array.isArray(data.errors) ? data.errors : [];
+      data.notes = (data.notes && typeof data.notes === 'object') ? data.notes : {};
       return data;
     }
     function flush() {
@@ -293,6 +294,16 @@
           d.tradeAttempts.unshift({ ...rec, tradeId: id });
           if (d.tradeAttempts.length > DIAG_MAX_TRADES) d.tradeAttempts.length = DIAG_MAX_TRADES;
           saveSoon();
+        } catch (e) { /* ignore */ }
+      },
+      // Record a single de-duped note (e.g. a masked URL shape). Unlike a counter it
+      // keeps the latest VALUE, and unlike error() it never floods the ring when a gate
+      // fires repeatedly - it writes only when the value actually changes.
+      note(key, val) {
+        try {
+          const d = load();
+          const v = scrub(String(val == null ? '' : val)).slice(0, 160);
+          if (d.notes[String(key)] !== v) { d.notes[String(key)] = v; saveSoon(); }
         } catch (e) { /* ignore */ }
       },
       // Run fn; capture + count any throw under `where`. Rethrows only when asked.
@@ -4261,6 +4272,15 @@ yasukuni sword|65|70|49|54
     return m ? m[1] : null;
   }
 
+  // Masked URL for diagnostics: digit runs -> '#', so a trade URL reveals its PARAM
+  // NAMES (is the id 'ID=', 'id=', 'tradeID='? in the hash or the query?) without ever
+  // carrying a real trade id or any other value. Used only when a trade bails at the
+  // isTradeLogPage()/currentTradeId() gate, to make a changed URL format diagnosable.
+  function maskUrlShape() {
+    try { return (location.pathname + location.search + location.hash).replace(/\d+/g, '#').slice(0, 160); }
+    catch (e) { return '?'; }
+  }
+
   // Persistent "already recorded" ledger, keyed on the trade ID. Capped so it can't
   // grow without bound; only IDs matter, not order.
   let processedTrades = loadProcessedTrades();
@@ -4423,10 +4443,15 @@ yasukuni sword|65|70|49|54
   }
 
   function readTradeLogImpl() {
-    if (!settings.trackTrades) return;
-    if (!isTradeLogPage()) return;
+    if (!settings.trackTrades) { Diag.bump('tradeGate:trackTradesOff'); return; }
+    // These two gates are the only places a trade can die BEFORE recordTradeAttempt, so
+    // without a counter here a whole class of "trades never tracked" (a renamed/moved
+    // ID= param, a Past-Trades SPA route, PDA) would leave an empty trade trace and tell
+    // us nothing. Count the gate and record the URL shape (digits masked to '#') once so
+    // the actual param layout is visible without a second round-trip to the user.
+    if (!isTradeLogPage()) { Diag.bump('tradeGate:notLogPage'); Diag.note('tradeUrl', maskUrlShape()); return; }
     const tradeId = currentTradeId();
-    if (!tradeId) return;
+    if (!tradeId) { Diag.bump('tradeGate:noTradeId'); Diag.note('tradeUrl', maskUrlShape()); return; }
     if (isTradeProcessed(tradeId)) { recordTradeAttempt(tradeId, 'already-recorded'); return; }
 
     const cont = document.querySelector('.trade-cont');
