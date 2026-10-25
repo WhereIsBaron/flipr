@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FLIPR: Flip Profit Tracker
 // @namespace    http://torn.city.com.dot.com.com
-// @version      2.43.0
+// @version      2.43.1
 // @description  Automatically logs what you paid for bazaar/item market purchases (via your own Torn API key) and warns you before you list them for less than a real profit, accounting for Torn's item market sales tax
 // @updateURL    https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
 // @downloadURL  https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
@@ -46,7 +46,7 @@
   ////////////////////////////////////////////////////////////////////////////
 
   const DEBUG = false;
-  const SCRIPT_VERSION = '2.43.0';
+  const SCRIPT_VERSION = '2.43.1';
 
   const STORAGE_KEY = 'flipr_lots_v1';
   const SETTINGS_KEY = 'flipr_settings_v1';
@@ -2165,6 +2165,12 @@
       // `weaponNameMatched: false` with a real `statPairSeen` means the name and the
       // numbers live in separate DOM branches (need the card outerHTML to pair them).
       recentClickCaptureAttempts,
+      // Per-trade-id trace of the trade reader: the furthest stage readTradeLog
+      // reached on each recent completed trade and why it stopped (see
+      // recordTradeAttempt). A trade that "isn't tracked" shows its failing gate
+      // here - e.g. `no-trade-cont` with a `hint.candidates` list points at a
+      // changed/mobile trade.php DOM; `self-name-unmatched` points at getSelfIdentity.
+      recentTradeAttempts,
     };
   }
 
@@ -3826,30 +3832,71 @@ yasukuni sword|65|70|49|54
     return Number.isFinite(t) ? t : Math.floor(Date.now() / 1000);
   }
 
+  // ---- Trade-reader diagnostics -------------------------------------------------
+  // A completed trade that never records is otherwise a black box: the reader just
+  // returns at whichever gate failed and leaves nothing behind. This keeps a tiny
+  // per-trade-id record of the furthest stage readTradeLog reached and why it
+  // stopped, surfaced in the debug export so a miss (a changed/mobile trade.php DOM,
+  // an unresolved self-name, half-rendered columns) can be root-caused from a user's
+  // export instead of guessed at. Read-only; stores short stage labels, player names
+  // and a few class-name hints only - never page HTML, money, or anything sensitive.
+  const recentTradeAttempts = [];
+  const TRADE_ATTEMPT_LIMIT = 6;
+  function recordTradeAttempt(tradeId, stage, extra) {
+    try {
+      const id = String(tradeId == null ? '?' : tradeId);
+      let rec = recentTradeAttempts.find((r) => r.tradeId === id);
+      if (!rec) {
+        rec = { tradeId: id };
+        recentTradeAttempts.unshift(rec);
+        if (recentTradeAttempts.length > TRADE_ATTEMPT_LIMIT) recentTradeAttempts.length = TRADE_ATTEMPT_LIMIT;
+      }
+      rec.stage = stage;
+      rec.at = new Date().toISOString();
+      if (extra) Object.assign(rec, extra);
+    } catch (e) { /* diagnostics must never break the reader */ }
+  }
+  // When `.trade-cont` is missing, sample what trade-ish containers DO exist so a
+  // changed/hashed/mobile layout is diagnosable without dumping raw HTML.
+  function tradeContainerHint() {
+    try {
+      const nodes = Array.from(document.querySelectorAll('[class*="trade"], [class*="Trade"]')).slice(0, 5);
+      const candidates = nodes.map((el) => String(el.className || el.tagName || '').slice(0, 48));
+      const body = document.body ? document.body.textContent || '' : '';
+      return {
+        acceptedInText: /the trade was accepted by/i.test(body),
+        candidates,
+        hasUserLeft: !!document.querySelector('.user.left'),
+        hasUserRight: !!document.querySelector('.user.right')
+      };
+    } catch (e) { return { error: String((e && e.message) || e) }; }
+  }
+
   function readTradeLog() {
     if (!settings.trackTrades) return;
     if (!isTradeLogPage()) return;
     const tradeId = currentTradeId();
-    if (!tradeId || isTradeProcessed(tradeId)) return;
+    if (!tradeId) return;
+    if (isTradeProcessed(tradeId)) { recordTradeAttempt(tradeId, 'already-recorded'); return; }
 
     const cont = document.querySelector('.trade-cont');
-    if (!cont) return; // React hasn't rendered the trade yet - the observer will call again
+    if (!cont) { recordTradeAttempt(tradeId, 'no-trade-cont', { hint: tradeContainerHint() }); return; } // not rendered yet, OR the DOM changed - hint samples what IS present
     const pageText = document.body ? document.body.textContent : '';
-    if (!/the trade was accepted by/i.test(pageText)) return; // not a completed/accepted trade
+    if (!/the trade was accepted by/i.test(pageText)) { recordTradeAttempt(tradeId, 'no-accepted-line'); return; } // not a completed/accepted trade
 
     const left = cont.querySelector('.user.left');
     const right = cont.querySelector('.user.right');
-    if (!left || !right) return;
+    if (!left || !right) { recordTradeAttempt(tradeId, 'no-user-columns', { leftFound: !!left, rightFound: !!right }); return; }
 
     const self = getSelfIdentity();
-    if (!self || !self.name) return; // can't tell which side is me - retry on a later load
+    if (!self || !self.name) { recordTradeAttempt(tradeId, 'no-self-identity', { selfIdFound: !!(self && self.id) }); return; } // can't tell which side is me - retry on a later load
     const norm = (s) => normalize(String(s || ''));
     const sides = [parseTradeSide(left), parseTradeSide(right)];
-    if (!sides[0].resolved || !sides[1].resolved) return; // columns still rendering - retry, don't mark done
+    if (!sides[0].resolved || !sides[1].resolved) { recordTradeAttempt(tradeId, 'sides-unresolved', { leftResolved: sides[0].resolved, rightResolved: sides[1].resolved }); return; } // columns still rendering - retry, don't mark done
     let mine = null, theirs = null;
     if (norm(sides[0].name) === norm(self.name)) { mine = sides[0]; theirs = sides[1]; }
     else if (norm(sides[1].name) === norm(self.name)) { mine = sides[1]; theirs = sides[0]; }
-    if (!mine) return; // neither header matched my name; don't guess, don't mark done
+    if (!mine) { recordTradeAttempt(tradeId, 'self-name-unmatched', { selfName: self.name, sideNames: [sides[0].name, sides[1].name] }); return; } // neither header matched my name; don't guess, don't mark done
 
     const tsSeconds = acceptedTsSeconds(pageText);
 
@@ -3859,6 +3906,7 @@ yasukuni sword|65|70|49|54
       const unitCost = mine.money / it.qty;
       const lotEntry = addLot(it.name, it.qty, unitCost, `trade:${tradeId}`, null, null);
       markTradeProcessed(tradeId);
+      recordTradeAttempt(tradeId, 'recorded-buy', { item: it.name, qty: it.qty });
       if (lotEntry) {
         renderAll();
         showToast(
@@ -3874,6 +3922,7 @@ yasukuni sword|65|70|49|54
       const it = mine.items[0];
       recordSale(it.name, it.qty, theirs.money, 0, 'trade', tsSeconds);
       markTradeProcessed(tradeId);
+      recordTradeAttempt(tradeId, 'recorded-sale', { item: it.name, qty: it.qty });
       renderAll();
       showToast(`FLIPR logged trade sale: ${it.qty}\\u00D7 ${it.name} for ${money(theirs.money)} (no tax)`);
       return;
@@ -3887,6 +3936,7 @@ yasukuni sword|65|70|49|54
     else if (mine.money && theirs.money) why = 'money on both sides';
     else if (mine.items.length + theirs.items.length === 0) why = 'no items';
     else why = 'mixed items and money';
+    recordTradeAttempt(tradeId, 'noted-not-priced', { why });
     showToast(`FLIPR: trade #${tradeId} not auto-priced (${why}) - log it by hand if you want it tracked`);
   }
 
