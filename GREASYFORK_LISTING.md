@@ -21,21 +21,21 @@ Small floating panel. Drag it anywhere, collapse it to a button.
 
 ### Read-only, fully within the rules
 
-It never clicks, submits, or fills anything for you. It reads your own API log and the numbers Torn already shows, then displays its own. Nothing is sent anywhere except Torn's own API, for your own account.
+It never clicks, submits, or fills anything for you. It reads your own API log and the numbers Torn already shows, then displays its own. Nothing is sent anywhere except Torn's own API, for your own account - apart from the optional cloud sync below, which is off until you turn it on.
 
 ### API Terms of Service
 
-You keep full control of your data. Everything is stored in your own browser and nothing is sent anywhere except Torn's own API, using your key, for your own account.
+You keep full control of your data. By default everything is stored in your own browser and nothing is sent anywhere except Torn's own API, using your key, for your own account. There is one optional extra - cloud sync - which is off unless you turn it on: with it on, FLIPR mirrors your own tracked data to a private cloud copy tied to your Torn ID so your desktop and PDA stay in sync. Your API key is never uploaded, including when sync is on, and turning sync off deletes the cloud copy.
 
 | Data Storage | Data Sharing | Purpose of Use | Key Storage & Sharing | Key Access Level |
 | --- | --- | --- | --- | --- |
-| Only locally | Nobody | Not eligible - only you have access | Stored locally / Not shared | Custom (see below) |
+| Locally in your browser; plus an optional private cloud copy if you turn on sync | Nobody else can read it - with sync on, a private copy locked to your Torn ID is stored in Google Firebase | Assistive use only; only you have access to your data | Stored locally; never shared or uploaded | Custom (see below) |
 
-Selections used: `user` -> `log` (your own buys and sells) and `torn` -> `items` (item names). Nothing else is requested.
+Selections used: `user` -> `basic` (your player id, so sync can confirm the key is yours), `user` -> `log` (your own buys and sells) and `torn` -> `items` (item names). Nothing else is requested.
 
-**Make a FLIPR-only key:** https://www.torn.com/preferences.php#tab=api?step=addNewKey&title=FLIPR&user=log&torn=items
+**Make a FLIPR-only key:** https://www.torn.com/preferences.php#tab=api?step=addNewKey&title=FLIPR&user=basic,log&torn=items
 
-That link opens Torn's Custom Key Builder with just those two boxes ticked. A key scoped this way cannot read your money, battle stats, messages or faction data, so if it ever leaks the damage is limited to your own trading history. There is a shortcut to the same link inside the script, next to where you paste the key. A Full key works too, but gives away far more than FLIPR ever reads.
+That link opens Torn's Custom Key Builder with just those three boxes ticked. A key scoped this way cannot read your money, battle stats, messages or faction data, so if it ever leaks the damage is limited to your own trading history and your player id. There is a shortcut to the same link inside the script, next to where you paste the key. A Full key works too, but gives away far more than FLIPR ever reads.
 
 ### Setup
 

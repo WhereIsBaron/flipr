@@ -110,8 +110,10 @@
     PROCESSED_LOG_IDS_KEY, PROCESSED_TRADES_KEY, PENDING_TICKETS_KEY, SETTINGS_KEY,
   ];
 
-  // Torn's Custom Key Builder, pre-filled for FLIPR. The two selections below are
+  // Torn's Custom Key Builder, pre-filled for FLIPR. The three selections below are
   // genuinely all this script calls:
+  //   user  > basic  the player's id/name - used only so cloud sync can confirm the
+  //                  key belongs to the signed-in player before minting their token
   //   user  > log    the user's own activity log - where buys and sells are read from
   //   torn  > items  the public item list, used only to turn an item id into a name
   // Nothing else is ever requested (see the COMPLIANCE NOTE at the top of the file).
@@ -2433,11 +2435,12 @@
       row.appendChild(saveBtn);
       container.appendChild(row);
 
-      // A one-click link to Torn's Custom Key Builder, pre-filled with ONLY the two
-      // selections FLIPR actually reads. Torn's own guidance is to request as little
-      // as possible, and a key scoped to these cannot be used to read your money,
-      // battle stats, messages, faction data or anything else - so if it ever leaks,
-      // the blast radius is your own buy/sell history and a public item list.
+      // A one-click link to Torn's Custom Key Builder, pre-filled with ONLY the three
+      // selections FLIPR needs (basic for sync identity, log for buys/sells, items for
+      // names). Torn's own guidance is to request as little as possible, and a key
+      // scoped to these cannot be used to read your money, battle stats, messages,
+      // faction data or anything else - so if it ever leaks, the blast radius is your
+      // own buy/sell history, your player id and a public item list.
       const keyHint = document.createElement('div');
       keyHint.className = 'flipr-hint';
       const keyLink = document.createElement('a');
@@ -2448,9 +2451,10 @@
       keyLink.style.color = '#4da3ff';
       keyHint.appendChild(keyLink);
       keyHint.appendChild(document.createTextNode(
-        ' - opens Torn with just the two boxes FLIPR needs already ticked: '
+        ' - opens Torn with just the three boxes FLIPR needs already ticked: '
+        + 'user > basic (your player id, so cloud sync can confirm the key is yours), '
         + 'user > log (your own buys and sells) and torn > items (item names). '
-        + 'If it opens without them ticked, tick those two by hand. A Full key works '
+        + 'If it opens without them ticked, tick those three by hand. A Full key works '
         + 'too, but gives away far more than this script ever reads.'
       ));
       container.appendChild(keyHint);
