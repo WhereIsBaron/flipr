@@ -4,6 +4,10 @@ Patch notes for FLIPR, a bazaar-flip profit tracker userscript for Torn. Created
 
 ---
 
+## v2.44.1
+- **Fix: cloud sync wouldn't turn on with a FLIPR-scoped key.** The "Make a FLIPR-only key" link only ticked `log` and `items`, but turning on sync also needs `basic` (just your player id) to confirm the key is yours before it signs you in - so enabling sync failed with Torn's "access level of this key is not high enough". The key link now includes `basic`, so a freshly made FLIPR key works for sync straight away.
+- **If you made your FLIPR key before this version, make a new one** (Settings → Make a FLIPR-only key) and paste it in. Item logging kept working the whole time - only sync needed the extra tick. Adding `basic` exposes only your player id, name, level and status (the lowest Torn access tier); your API key is still never uploaded.
+
 ## v2.44.0
 - **New: optional cloud sync - your FLIPR data can now follow you between devices.** Turn it on under Settings → Cloud sync (off by default, behind a one-time consent prompt) and FLIPR keeps your own tracked data - holdings, sales, points, the "already counted" ledgers and your settings - mirrored to a private cloud store, then pulls it back on any other device where you switch it on. It's how your PDA and your desktop can finally show the same numbers without exporting and re-importing by hand.
 - **Your data stays yours.** The sync is tied to your own verified Torn ID, so you can only ever read or write your own snapshot - nobody else can see it and you can't see theirs. **Your API key is never uploaded** (it stays on each device, exactly as before), and turning cloud sync back off **deletes your cloud copy**. Still read-only toward Torn: sync only moves FLIPR's own numbers between your devices, it never touches the game.
