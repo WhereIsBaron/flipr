@@ -4,6 +4,10 @@ Patch notes for FLIPR, a bazaar-flip profit tracker userscript for Torn. Created
 
 ---
 
+## v2.45.0
+- **Diagnostics now travel with cloud sync, so a tracking problem can be fixed without asking you for anything.** FLIPR already kept a short "why wasn't this recorded?" trace for its debug export. That trace, plus running health counters and the last few caught errors, is now saved on your device and - if you use cloud sync - mirrored into your own private cloud copy. If your sells or trades ever stop being tracked, the exact gate they stop at is visible straight away, so the fix can follow with no back-and-forth. Nothing about how FLIPR tracks your buys and sells changes.
+- **Still diagnostics only, same privacy bar as the export.** What's stored is counters, short error messages, the per-trade trace (status labels, the trade's player names, a couple of layout hints) and whether you're on the PDA - never page contents, never money figures, and your API key is still never uploaded. If you don't use cloud sync, it simply stays on your device.
+
 ## v2.44.1
 - **Fix: cloud sync wouldn't turn on with a FLIPR-scoped key.** The "Make a FLIPR-only key" link only ticked `log` and `items`, but turning on sync also needs `basic` (just your player id) to confirm the key is yours before it signs you in - so enabling sync failed with Torn's "access level of this key is not high enough". The key link now includes `basic`, so a freshly made FLIPR key works for sync straight away.
 - **If you made your FLIPR key before this version, make a new one** (Settings → Make a FLIPR-only key) and paste it in. Item logging kept working the whole time - only sync needed the extra tick. Adding `basic` exposes only your player id, name, level and status (the lowest Torn access tier); your API key is still never uploaded.

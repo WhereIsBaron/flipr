@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FLIPR: Flip Profit Tracker
 // @namespace    http://torn.city.com.dot.com.com
-// @version      2.44.1
+// @version      2.45.0
 // @description  Automatically logs what you paid for bazaar/item market purchases (via your own Torn API key) and warns you before you list them for less than a real profit, accounting for Torn's item market sales tax
 // @updateURL    https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
 // @downloadURL  https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
@@ -61,7 +61,7 @@
   ////////////////////////////////////////////////////////////////////////////
 
   const DEBUG = false;
-  const SCRIPT_VERSION = '2.44.1';
+  const SCRIPT_VERSION = '2.45.0';
 
   const STORAGE_KEY = 'flipr_lots_v1';
   const SETTINGS_KEY = 'flipr_settings_v1';
@@ -83,6 +83,15 @@
   const SALES_KEY = 'flipr_sales_v1';
   const RECENT_SALES_MAX = 200; // cap on the per-sale detail list; the running totals are uncapped
   const SALES_ROWS_SHOWN = 30; // how many of those rows are actually DRAWN (perf; totals cover all)
+
+  // Durable diagnostics (see the DIAGNOSTICS section). Persisted to its own key and
+  // synced, so a "nothing is being recorded" bug shows its failing gate in the
+  // user's own cloud doc WITHOUT a debug export. Diagnostics only - cumulative
+  // counters, the last few caught errors, the persisted trade trace, the runtime
+  // environment. No page HTML, no money figures, no API key (same bar as the export).
+  const DIAG_KEY = 'flipr_diag_v1';
+  const DIAG_MAX_ERRORS = 15; // ring-buffer size for caught exceptions
+  const DIAG_MAX_TRADES = 10; // persisted per-trade-id trace depth
 
   // CLOUD SYNC (opt-in, OFF by default). See the CLOUD SYNC section below and the
   // COMPLIANCE NOTE at the top. Reuses BUSTR's already-deployed Firebase project +
@@ -108,6 +117,9 @@
   const CLOUD_SYNC_KEYS = [
     STORAGE_KEY, SALES_KEY, POINTS_STATS_KEY, LOG_STATE_KEY,
     PROCESSED_LOG_IDS_KEY, PROCESSED_TRADES_KEY, PENDING_TICKETS_KEY, SETTINGS_KEY,
+    // Diagnostics ride along so a maintainer can read WHY a device records nothing
+    // straight from that device's own cloud doc. Pure diagnostics (see DIAG_KEY).
+    DIAG_KEY,
   ];
 
   // Torn's Custom Key Builder, pre-filled for FLIPR. The three selections below are
@@ -212,6 +224,82 @@
   // after a successful write; it is a no-op until (and unless) the user turns sync
   // on. Declared here so the savers can reference it before that section is parsed.
   let cloudTouch = () => {};
+
+  ////////////////////////////////////////////////////////////////////////////
+  ////  DIAGNOSTICS (persisted + synced health/error trace)
+  ////////////////////////////////////////////////////////////////////////////
+  // buildDebugExport() below is rich, but it is EPHEMERAL - it only exists the
+  // instant a user clicks Export and hands it over. For a "why is nothing being
+  // recorded?" report that has to be chased without the user present, that is too
+  // late. Diag is the durable counterpart: a tiny rolling health record written to
+  // its own key and (when sync is on) pushed to the user's OWN cloud doc, so the
+  // failing gate is visible in Firestore with nothing to ask for.
+  //
+  // It is strictly diagnostics and meets the same read-only bar as the export:
+  // cumulative counters, the last few caught exceptions (message + trimmed stack,
+  // with any long token-shaped run scrubbed to '***'), the persisted per-trade-id
+  // trace, and the runtime environment (PDA/GM/viewport). Never page HTML, never a
+  // money figure, never the API key. Every method is self-guarded - diagnostics
+  // must never be the thing that breaks a caller.
+  const Diag = (() => {
+    const scrub = (s) => String(s == null ? '' : s).replace(/[A-Za-z0-9_-]{16,}/g, '***');
+    const empty = () => ({ v: 1, scriptVersion: SCRIPT_VERSION, updatedAt: 0, env: {}, counters: {}, tradeAttempts: [], errors: [] });
+    let data = null, saveTimer = null;
+    function load() {
+      if (data) return data;
+      try { const raw = Store.get(DIAG_KEY, ''); data = raw ? JSON.parse(raw) : empty(); } catch (e) { data = empty(); }
+      if (!data || typeof data !== 'object') data = empty();
+      data.counters = (data.counters && typeof data.counters === 'object') ? data.counters : {};
+      data.tradeAttempts = Array.isArray(data.tradeAttempts) ? data.tradeAttempts : [];
+      data.errors = Array.isArray(data.errors) ? data.errors : [];
+      return data;
+    }
+    function flush() {
+      const d = load();
+      d.updatedAt = Date.now();
+      d.scriptVersion = SCRIPT_VERSION;
+      try { d.env = { isPDA: isPDA(), useGM: USE_GM_STORAGE, viewport: `${window.innerWidth}x${window.innerHeight}` }; } catch (e) { /* ignore */ }
+      try { Store.set(DIAG_KEY, JSON.stringify(d)); } catch (e) { /* ignore */ }
+      // A sale/trade that bails at an early gate changes no other state, so nothing
+      // else would ever call cloudTouch - Diag has to schedule its own push or the
+      // trace never leaves the device. Safe: cloudTouch is a no-op until sync is on.
+      try { cloudTouch(); } catch (e) { /* ignore */ }
+    }
+    // Coalesce a burst of events (one poll can process 100 log entries) into a
+    // single write + push instead of hammering storage and the debounced uploader.
+    function saveSoon() { if (saveTimer) return; saveTimer = setTimeout(() => { saveTimer = null; try { flush(); } catch (e) { /* never break a caller */ } }, 1500); }
+    return {
+      // Increment a named counter, e.g. 'salesRecorded' or 'tradeStage:no-trade-cont'.
+      bump(name, by) { try { const d = load(); d.counters[String(name)] = (d.counters[String(name)] || 0) + (by || 1); saveSoon(); } catch (e) { /* ignore */ } },
+      // Record a caught exception under a short, HTML-free context label.
+      error(where, err) {
+        try {
+          const d = load();
+          const msg = scrub(err && err.message ? err.message : err).slice(0, 200);
+          const stack = err && err.stack ? scrub(String(err.stack).split('\n').slice(0, 3).join(' | ')).slice(0, 300) : '';
+          d.errors.unshift({ where: String(where).slice(0, 60), msg, stack, ts: Date.now() });
+          if (d.errors.length > DIAG_MAX_ERRORS) d.errors.length = DIAG_MAX_ERRORS;
+          d.counters.errors = (d.counters.errors || 0) + 1;
+          saveSoon();
+        } catch (e) { /* diagnostics must never throw */ }
+      },
+      // Persist the furthest-stage trace for one trade id (mirrors recentTradeAttempts).
+      trade(rec) {
+        try {
+          if (!rec || rec.tradeId == null) return;
+          const d = load();
+          const id = String(rec.tradeId);
+          d.tradeAttempts = d.tradeAttempts.filter((r) => r.tradeId !== id);
+          d.tradeAttempts.unshift({ ...rec, tradeId: id });
+          if (d.tradeAttempts.length > DIAG_MAX_TRADES) d.tradeAttempts.length = DIAG_MAX_TRADES;
+          saveSoon();
+        } catch (e) { /* ignore */ }
+      },
+      // Run fn; capture + count any throw under `where`. Rethrows only when asked.
+      guard(where, fn, rethrow) { try { return fn(); } catch (e) { this.error(where, e); if (rethrow) throw e; return undefined; } },
+      snapshot() { try { return load(); } catch (e) { return null; } },
+    };
+  })();
 
   function loadLots() {
     try {
@@ -1427,7 +1515,7 @@
     qty = Number(qty);
     proceeds = Number(proceeds);
     fee = Number(fee) || 0;
-    if (!itemName || !(qty > 0) || !(proceeds >= 0)) return null;
+    if (!itemName || !(qty > 0) || !(proceeds >= 0)) { Diag.bump('saleRejected:badArgs'); return null; }
 
     const { matchedQty, matchedCost, matchedStats } =
       market === 'points'
@@ -1472,6 +1560,10 @@
       salesData.recent = salesData.recent.slice(-RECENT_SALES_MAX);
     }
     saveSales(salesData);
+    // A recorded sale is the signal that proves the whole sell path reached storage
+    // for this device - split by market so 'all trades, no market sells' is legible.
+    Diag.bump('salesRecorded');
+    Diag.bump('sale:' + (market || '?'));
     return record;
   }
 
@@ -2606,6 +2698,10 @@
       // here - e.g. `no-trade-cont` with a `hint.candidates` list points at a
       // changed/mobile trade.php DOM; `self-name-unmatched` points at getSelfIdentity.
       recentTradeAttempts,
+      // The durable, synced diagnostics record (counters, caught-error ring, the
+      // persisted trade trace, environment). Same data a maintainer can read from
+      // the user's cloud doc - included here so a pasted export carries it too.
+      diag: Diag.snapshot(),
     };
   }
 
@@ -4297,6 +4393,10 @@ yasukuni sword|65|70|49|54
       rec.stage = stage;
       rec.at = new Date().toISOString();
       if (extra) Object.assign(rec, extra);
+      // Mirror the furthest stage into the durable, synced trace and count it, so a
+      // trade that "isn't tracked" shows its exact failing gate in the cloud doc.
+      Diag.trade(rec);
+      Diag.bump('tradeStage:' + String(stage));
     } catch (e) { /* diagnostics must never break the reader */ }
   }
   // When `.trade-cont` is missing, sample what trade-ish containers DO exist so a
@@ -4315,7 +4415,14 @@ yasukuni sword|65|70|49|54
     } catch (e) { return { error: String((e && e.message) || e) }; }
   }
 
+  // Thin guard wrapper: a throw anywhere in the reader (getSelfIdentity,
+  // parseTradeSide, addLot, recordSale) is captured as a diagnostic instead of
+  // silently aborting the trade with no trace of why.
   function readTradeLog() {
+    try { readTradeLogImpl(); } catch (e) { Diag.error('readTradeLog', e); }
+  }
+
+  function readTradeLogImpl() {
     if (!settings.trackTrades) return;
     if (!isTradeLogPage()) return;
     const tradeId = currentTradeId();
@@ -4945,9 +5052,18 @@ yasukuni sword|65|70|49|54
       // "not a purchase".
       if (SALE_LOG_TYPE_IDS.has(typeId)) {
         if (hasEntryId) markLogIdProcessed(entryId);
-        const stored = processSaleEntry(entry, typeId);
-        if (stored) matchedCount++;
-        else if (skipped.length < 20) skipped.push({ title: details.title, category: details.category, rawData: entry.data });
+        // Counters answer the PozoLMS-shaped question directly: a device with
+        // saleEntrySeen > 0 but saleEntryRecorded == 0 is a sell-parsing/recording
+        // bug (the id was already claimed above, so the sale is otherwise lost with
+        // no trace); saleEntrySeen == 0 means this account simply had no market
+        // sells and any missing sales are the player-trade path instead.
+        Diag.bump('saleEntrySeen');
+        const stored = Diag.guard('processSaleEntry', () => processSaleEntry(entry, typeId));
+        if (stored) { matchedCount++; Diag.bump('saleEntryRecorded'); }
+        else {
+          Diag.bump('saleEntryDropped');
+          if (skipped.length < 20) skipped.push({ title: details.title, category: details.category, rawData: entry.data });
+        }
         continue;
       }
 
@@ -5098,6 +5214,7 @@ yasukuni sword|65|70|49|54
     } catch (e) {
       log('pollLog failed', e);
       lastPollDebug = { at: new Date().toISOString(), since: null, fetchedCount: null, matchedCount: 0, skipped: [], error: e.message };
+      Diag.error('pollLog', e);
       // Torn code 2 = incorrect key, 16 = access level too low. Both are
       // permanent for this key (a typo, a revoked key, or a key without the
       // `log` selection), not a transient network blip - so stop the auto-poll
