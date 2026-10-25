@@ -46,7 +46,7 @@
   ////////////////////////////////////////////////////////////////////////////
 
   const DEBUG = false;
-  const SCRIPT_VERSION = '2.42.0';
+  const SCRIPT_VERSION = '2.43.0';
 
   const STORAGE_KEY = 'flipr_lots_v1';
   const SETTINGS_KEY = 'flipr_settings_v1';
@@ -838,7 +838,7 @@
     input.addEventListener('blur', () => finish(true));
   }
 
-  // Same inline-edit dance as startPriceEdit, but for the COUNT - swap the "×N"
+  // Same inline-edit dance as startPriceEdit, but for the COUNT - swap the "\\u00D7N"
   // for a small number box so an untracked sale can be corrected by hand (bought 10,
   // quietly sold 5, type 5). The per-unit price is left alone, so the row's money just
   // follows the new count. A blended ("lump") row can only be corrected DOWNward and
@@ -3862,7 +3862,7 @@ yasukuni sword|65|70|49|54
       if (lotEntry) {
         renderAll();
         showToast(
-          `FLIPR logged trade buy: ${it.qty}× ${it.name} @ ${money(unitCost)}`,
+          `FLIPR logged trade buy: ${it.qty}\\u00D7 ${it.name} @ ${money(unitCost)}`,
           () => undoLotQty(lotEntry.id, it.qty)
         );
       }
@@ -3875,7 +3875,7 @@ yasukuni sword|65|70|49|54
       recordSale(it.name, it.qty, theirs.money, 0, 'trade', tsSeconds);
       markTradeProcessed(tradeId);
       renderAll();
-      showToast(`FLIPR logged trade sale: ${it.qty}× ${it.name} for ${money(theirs.money)} (no tax)`);
+      showToast(`FLIPR logged trade sale: ${it.qty}\\u00D7 ${it.name} for ${money(theirs.money)} (no tax)`);
       return;
     }
 
