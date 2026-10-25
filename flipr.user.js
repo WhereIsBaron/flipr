@@ -123,7 +123,7 @@
   // no error - it just silently does nothing. Verified against TornW3b's working link:
   //   ...preferences.php#tab=api?step=addNewKey&title=TornW3B&user=basic,bazaar,log,...
   const CUSTOM_KEY_URL =
-    'https://www.torn.com/preferences.php#tab=api?step=addNewKey&title=FLIPR&user=log&torn=items';
+    'https://www.torn.com/preferences.php#tab=api?step=addNewKey&title=FLIPR&user=basic,log&torn=items';
 
   const FETCH_TIMEOUT_MS = 10000;
   const API_KEY_REGEX = /^[A-Za-z0-9]{16,}$/;
