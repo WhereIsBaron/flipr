@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FLIPR: Flip Profit Tracker
 // @namespace    http://torn.city.com.dot.com.com
-// @version      2.43.1
+// @version      2.44.0
 // @description  Automatically logs what you paid for bazaar/item market purchases (via your own Torn API key) and warns you before you list them for less than a real profit, accounting for Torn's item market sales tax
 // @updateURL    https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
 // @downloadURL  https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
@@ -13,22 +13,37 @@
 // @grant        GM_deleteValue
 // @grant        GM_addValueChangeListener
 // @grant        unsafeWindow
+// @grant        GM_xmlhttpRequest
 // @connect      api.torn.com
+// @connect      bustr-jail-bust-assistant.netlify.app
+// @connect      identitytoolkit.googleapis.com
+// @connect      securetoken.googleapis.com
+// @connect      firestore.googleapis.com
 // @license      MIT
 // ==/UserScript==
 
 // ---------------------------------------------------------------------------
 // COMPLIANCE NOTE (read this before adding anything new):
-// This script is a read-only assistant. It never clicks, submits, or fills
-// any form field on the user's behalf - it only reads text/data Torn (or
+// This script is a read-only assistant to Torn. It never clicks, submits, or
+// fills any form field on the user's behalf - it only reads text/data Torn (or
 // the user's own Torn API key) already produced, and writes its own numbers
 // into its own floating panel. Purchase data enters storage either because
 // the user typed it into FLIPR's own panel, or because FLIPR polled the
 // user's own activity log via Torn's official API using a key the user
-// entered themselves. It never performs a game action, never calls any
-// endpoint other than the official read-only Torn API, and never sends
-// data anywhere but api.torn.com (using the user's own key, for the user's
-// own account). Keep it that way.
+// entered themselves. It never performs a game action and never calls any
+// Torn endpoint other than the official read-only Torn API, using the user's
+// own key, for the user's own account. Keep it that way.
+//
+// CLOUD SYNC (opt-in, OFF by default): the only data FLIPR ever sends off the
+// user's machine. When - and only when - the user explicitly turns on cloud
+// sync (Settings > Cloud sync, with a consent prompt), FLIPR mirrors the
+// user's OWN tracked data (holdings, sales, points, dedup ledgers, settings)
+// to a private per-account document in the maintainer's Firebase, so their
+// desktop and the Torn PDA stay in sync. It is still never a game action, and
+// it is not sent to Torn. The user's API key is NEVER uploaded. Access is
+// scoped to the user's own verified Torn id (server-mints a token for only
+// their own row), and the whole document is deleted when sync is turned off.
+// Nothing uploads until the user opts in. Keep it that way.
 // ---------------------------------------------------------------------------
 // See CHANGELOG.md for full version history.
 //
@@ -46,7 +61,7 @@
   ////////////////////////////////////////////////////////////////////////////
 
   const DEBUG = false;
-  const SCRIPT_VERSION = '2.43.1';
+  const SCRIPT_VERSION = '2.44.0';
 
   const STORAGE_KEY = 'flipr_lots_v1';
   const SETTINGS_KEY = 'flipr_settings_v1';
@@ -68,6 +83,32 @@
   const SALES_KEY = 'flipr_sales_v1';
   const RECENT_SALES_MAX = 200; // cap on the per-sale detail list; the running totals are uncapped
   const SALES_ROWS_SHOWN = 30; // how many of those rows are actually DRAWN (perf; totals cover all)
+
+  // CLOUD SYNC (opt-in, OFF by default). See the CLOUD SYNC section below and the
+  // COMPLIANCE NOTE at the top. Reuses BUSTR's already-deployed Firebase project +
+  // auth function; all three values below are public by design - the function
+  // verifies the user's Torn key server-side and mints a token scoped to the
+  // user's OWN verified Torn id, so these cannot be used to read or write anyone
+  // else's data (Firestore rules lock /flipr_users/<id> to that id).
+  const CLOUD_FUNCTION_URL = 'https://bustr-jail-bust-assistant.netlify.app/.netlify/functions/bustr-auth';
+  const CLOUD_FIREBASE_API_KEY = 'AIzaSyCw5UQGI-N1pEJZ7xg3OvO_elaTLQfeDYg';
+  const CLOUD_PROJECT_ID = 'bustr---jail-bust-assistant';
+  const CLOUD_TIMEOUT_MS = 20000;
+  const CLOUD_PUSH_DEBOUNCE_MS = 4000;
+  // Device-local cloud keys - NEVER uploaded (not in CLOUD_SYNC_KEYS) and never in
+  // the debug export. The enabled flag is deliberately per-device and OUTSIDE the
+  // synced settings blob, so adopting another device's snapshot can never silently
+  // switch sync on for a device that never consented.
+  const CLOUD_ENABLED_KEY = 'flipr_cloud_enabled_v1';
+  const CLOUD_AUTH_KEY = 'flipr_cloud_auth_v1';
+  const CLOUD_META_KEY = 'flipr_cloud_meta_v1';
+  // The user data that syncs across devices (full-snapshot, newest-device-wins).
+  // Deliberately EXCLUDES the API key (flipr_api_key) and the regenerating daily
+  // item-name cache (flipr_item_catalog_v1).
+  const CLOUD_SYNC_KEYS = [
+    STORAGE_KEY, SALES_KEY, POINTS_STATS_KEY, LOG_STATE_KEY,
+    PROCESSED_LOG_IDS_KEY, PROCESSED_TRADES_KEY, PENDING_TICKETS_KEY, SETTINGS_KEY,
+  ];
 
   // Torn's Custom Key Builder, pre-filled for FLIPR. The two selections below are
   // genuinely all this script calls:
@@ -165,6 +206,11 @@
     },
   };
 
+  // Set by the CLOUD SYNC section once it initializes. Every saver below calls it
+  // after a successful write; it is a no-op until (and unless) the user turns sync
+  // on. Declared here so the savers can reference it before that section is parsed.
+  let cloudTouch = () => {};
+
   function loadLots() {
     try {
       const raw = Store.get(STORAGE_KEY, '[]');
@@ -179,6 +225,7 @@
   function saveLots(lots) {
     try {
       Store.set(STORAGE_KEY, JSON.stringify(lots));
+      cloudTouch();
     } catch (e) {
       log('saveLots failed', e);
     }
@@ -253,6 +300,7 @@
   function saveSettings(settings) {
     try {
       Store.set(SETTINGS_KEY, JSON.stringify(settings));
+      cloudTouch();
     } catch (e) {
       log('saveSettings failed', e);
     }
@@ -318,6 +366,7 @@
   function saveLogState(stateObj) {
     try {
       Store.set(LOG_STATE_KEY, JSON.stringify(stateObj));
+      cloudTouch();
     } catch (e) {
       log('saveLogState failed', e);
     }
@@ -352,6 +401,7 @@
   function savePointsStats(pointsLots) {
     try {
       Store.set(POINTS_STATS_KEY, JSON.stringify(pointsLots));
+      cloudTouch();
     } catch (e) {
       log('savePointsStats failed', e);
     }
@@ -389,6 +439,7 @@
   function saveSales(data) {
     try {
       Store.set(SALES_KEY, JSON.stringify(data));
+      cloudTouch();
     } catch (e) {
       log('saveSales failed', e);
     }
@@ -410,6 +461,7 @@
   function saveProcessedLogIds(ids) {
     try {
       Store.set(PROCESSED_LOG_IDS_KEY, JSON.stringify(ids));
+      cloudTouch();
     } catch (e) {
       log('saveProcessedLogIds failed', e);
     }
@@ -441,6 +493,7 @@
   function saveTickets(t) {
     try {
       Store.set(PENDING_TICKETS_KEY, JSON.stringify(t));
+      cloudTouch();
     } catch (e) {
       log('saveTickets failed', e);
     }
@@ -544,6 +597,307 @@
       renderAll();
     });
   }
+
+  ////////////////////////////////////////////////////////////////////////////
+  ////  CLOUD SYNC (opt-in cross-device backup)
+  ////////////////////////////////////////////////////////////////////////////
+  // Optional and OFF until the user turns it on (see the COMPLIANCE NOTE up top).
+  // When on, FLIPR keeps the user's OWN tracked data mirrored to a private per-
+  // account document so the same Torn account stays in sync across desktop and the
+  // Torn PDA. It never uploads the API key, never performs a game action, and the
+  // whole document is deleted when sync is turned off. Reuses BUSTR's already-
+  // deployed Firebase project + auth function (that function verifies the Torn key
+  // server-side and mints a token scoped to the user's own verified id, so a user
+  // can only ever touch their own row).
+  //
+  // Transport is platform adaptive, the same split FLIPR already makes for storage:
+  //   desktop  -> GM_xmlhttpRequest (dodges torn.com's connect-src CSP; fetch is
+  //               blocked for these cross-origin hosts)
+  //   Torn PDA -> PDA_httpGet / PDA_httpPost, the PDA's native bridge. It has no
+  //               PATCH, so writes use Firestore's documents:commit endpoint (a
+  //               POST) with an `update` write and no updateMask, which fully
+  //               overwrites/creates the doc - exactly the full-snapshot we want.
+  //
+  // Reconciliation is full-snapshot, newest-device-wins (v1): each device stamps a
+  // local dataModifiedAt whenever its data changes; at load, if the cloud copy is
+  // strictly newer it is adopted wholesale, otherwise this device's copy is pushed
+  // up. Known v1 limit: editing on two devices between syncs lets the later push
+  // win and the other device's not-yet-synced edits are overwritten.
+  const CLOUD_W = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+  const cloudHasGMXhr = typeof GM_xmlhttpRequest !== 'undefined';
+  const cloudHasPDABridge = () => typeof CLOUD_W.PDA_httpGet === 'function' && typeof CLOUD_W.PDA_httpPost === 'function';
+
+  // One request helper over both transports. Only GET and POST are ever used (see
+  // the commit note above), so the PDA bridge covers everything.
+  function cloudRequest(method, url, headers, body) {
+    return new Promise((resolve, reject) => {
+      const done = (status, text) => resolve({ status: Number(status || 0), text: String(text == null ? '' : text) });
+      if (isPDA() && cloudHasPDABridge()) {
+        let settled = false;
+        const guard = setTimeout(() => { if (!settled) { settled = true; reject(new Error('request timed out')); } }, CLOUD_TIMEOUT_MS);
+        const fin = (r) => { if (settled) return; settled = true; clearTimeout(guard); done((r && r.status) || 0, (r && r.responseText) || ''); };
+        const err = (e) => { if (settled) return; settled = true; clearTimeout(guard); reject(e instanceof Error ? e : new Error('network error')); };
+        try {
+          const p = method === 'GET'
+            ? CLOUD_W.PDA_httpGet(url, headers || {})
+            : CLOUD_W.PDA_httpPost(url, headers || {}, body == null ? '' : body);
+          Promise.resolve(p).then(fin, err);
+        } catch (e) { err(e); }
+        return;
+      }
+      if (cloudHasGMXhr) {
+        const opts = {
+          method, url, headers: headers || {}, timeout: CLOUD_TIMEOUT_MS,
+          onload: (r) => done(r.status, r.responseText),
+          onerror: () => reject(new Error('network error')),
+          ontimeout: () => reject(new Error('request timed out')),
+        };
+        if (body != null) opts.data = body;
+        GM_xmlhttpRequest(opts);
+        return;
+      }
+      reject(new Error('cloud sync needs a userscript manager or the Torn PDA'));
+    });
+  }
+
+  // Firestore typed-value (de)serialisation.
+  function cloudToFs(v) {
+    if (v === null || v === undefined) return { nullValue: null };
+    if (typeof v === 'boolean') return { booleanValue: v };
+    if (typeof v === 'number') return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
+    if (typeof v === 'string') return { stringValue: v };
+    if (Array.isArray(v)) return { arrayValue: { values: v.map(cloudToFs) } };
+    if (typeof v === 'object') {
+      const fields = {}; for (const k of Object.keys(v)) fields[k] = cloudToFs(v[k]);
+      return { mapValue: { fields } };
+    }
+    return { stringValue: String(v) };
+  }
+  function cloudFromFs(val) {
+    if (!val || typeof val !== 'object') return undefined;
+    if ('nullValue' in val) return null;
+    if ('booleanValue' in val) return val.booleanValue;
+    if ('integerValue' in val) return Number(val.integerValue);
+    if ('doubleValue' in val) return Number(val.doubleValue);
+    if ('stringValue' in val) return val.stringValue;
+    if ('arrayValue' in val) return ((val.arrayValue && val.arrayValue.values) || []).map(cloudFromFs);
+    if ('mapValue' in val) {
+      const out = {}; const f = (val.mapValue && val.mapValue.fields) || {};
+      for (const k of Object.keys(f)) out[k] = cloudFromFs(f[k]);
+      return out;
+    }
+    return undefined;
+  }
+
+  const cloudDocPath = (uid) => `projects/${CLOUD_PROJECT_ID}/databases/(default)/documents/flipr_users/${uid}`;
+  const cloudDocUrl = (uid) => `https://firestore.googleapis.com/v1/${cloudDocPath(uid)}`;
+  const cloudCommitUrl = () => `https://firestore.googleapis.com/v1/projects/${CLOUD_PROJECT_ID}/databases/(default)/documents:commit`;
+
+  // Auth session (refresh token, uid, playerId), enabled flag, and sync meta all
+  // live in their OWN device-local keys via Store - kept out of `settings`, out of
+  // CLOUD_SYNC_KEYS, and out of the debug export on purpose.
+  let cloudAuth = null;
+  let cloudIdToken = null, cloudIdTokenExpiry = 0, cloudPushTimer = null, cloudBusy = false;
+  const cloudLoadAuth = () => {
+    if (cloudAuth) return cloudAuth;
+    try { const raw = Store.get(CLOUD_AUTH_KEY, ''); cloudAuth = raw ? JSON.parse(raw) : null; } catch (e) { cloudAuth = null; }
+    return cloudAuth;
+  };
+  const cloudSaveAuth = (a) => {
+    cloudAuth = a || null;
+    try { if (a) Store.set(CLOUD_AUTH_KEY, JSON.stringify(a)); else Store.del(CLOUD_AUTH_KEY); } catch (e) { /* ignore */ }
+  };
+  const cloudEnabled = () => { try { return Store.get(CLOUD_ENABLED_KEY, '0') === '1'; } catch (e) { return false; } };
+  const setCloudEnabled = (on) => { try { Store.set(CLOUD_ENABLED_KEY, on ? '1' : '0'); } catch (e) { /* ignore */ } };
+  const cloudLoadMeta = () => { try { const raw = Store.get(CLOUD_META_KEY, ''); return raw ? JSON.parse(raw) : {}; } catch (e) { return {}; } };
+  const cloudSaveMeta = (m) => { try { Store.set(CLOUD_META_KEY, JSON.stringify(m || {})); } catch (e) { /* ignore */ } };
+  const cloudSignedIn = () => { const a = cloudLoadAuth(); return !!(a && a.refreshToken); };
+  const cloudAvailable = () => (isPDA() ? cloudHasPDABridge() : cloudHasGMXhr);
+
+  async function cloudSignIn(apiKey) {
+    const r1 = await cloudRequest('POST', CLOUD_FUNCTION_URL, { 'Content-Type': 'application/json' }, JSON.stringify({ apiKey }));
+    const d1 = JSON.parse(r1.text || '{}');
+    if (r1.status !== 200) throw new Error(d1.error || ('auth failed (' + r1.status + ')'));
+    const r2 = await cloudRequest('POST',
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=${CLOUD_FIREBASE_API_KEY}`,
+      { 'Content-Type': 'application/json' }, JSON.stringify({ token: d1.token, returnSecureToken: true }));
+    const d2 = JSON.parse(r2.text || '{}');
+    if (r2.status !== 200) throw new Error((d2.error && d2.error.message) || 'sign-in failed');
+    cloudIdToken = d2.idToken;
+    cloudIdTokenExpiry = Date.now() + (Number(d2.expiresIn || 3600) - 60) * 1000;
+    cloudSaveAuth({ refreshToken: d2.refreshToken, uid: d1.uid, playerId: d1.playerId });
+    return cloudLoadAuth();
+  }
+  async function cloudRefreshToken() {
+    const a = cloudLoadAuth();
+    if (!a || !a.refreshToken) throw new Error('not signed in');
+    const r = await cloudRequest('POST',
+      `https://securetoken.googleapis.com/v1/token?key=${CLOUD_FIREBASE_API_KEY}`,
+      { 'Content-Type': 'application/x-www-form-urlencoded' },
+      'grant_type=refresh_token&refresh_token=' + encodeURIComponent(a.refreshToken));
+    const d = JSON.parse(r.text || '{}');
+    if (r.status !== 200) throw new Error((d.error && d.error.message) || 'token refresh failed');
+    cloudIdToken = d.id_token;
+    cloudIdTokenExpiry = Date.now() + (Number(d.expires_in || 3600) - 60) * 1000;
+    if (d.refresh_token) cloudSaveAuth({ ...a, refreshToken: d.refresh_token });
+  }
+  async function cloudEnsureToken() {
+    if (cloudIdToken && Date.now() < cloudIdTokenExpiry) return cloudIdToken;
+    await cloudRefreshToken();
+    return cloudIdToken;
+  }
+
+  async function cloudFsGet(uid) {
+    const t = await cloudEnsureToken();
+    const r = await cloudRequest('GET', cloudDocUrl(uid), { Authorization: 'Bearer ' + t });
+    if (r.status === 404) return null;
+    if (r.status !== 200) throw new Error('cloud read failed (' + r.status + ')');
+    const fields = (JSON.parse(r.text || '{}').fields) || {};
+    if (!fields.data) return null;
+    return {
+      data: cloudFromFs(fields.data) || {},
+      updatedAt: fields.updatedAt ? Number(cloudFromFs(fields.updatedAt)) : 0,
+    };
+  }
+  async function cloudFsSet(uid, snap, updatedAt) {
+    const t = await cloudEnsureToken();
+    const writeDoc = {
+      name: cloudDocPath(uid),
+      fields: {
+        data: cloudToFs(snap),
+        updatedAt: cloudToFs(updatedAt),
+        playerId: cloudToFs(String((cloudLoadAuth() || {}).playerId || '')),
+        v: cloudToFs(1),
+      },
+    };
+    // `update` with no updateMask = full overwrite + create-if-absent (Firestore
+    // commit semantics), i.e. the exact set-the-whole-snapshot we want.
+    const body = JSON.stringify({ writes: [{ update: writeDoc }] });
+    const r = await cloudRequest('POST', cloudCommitUrl(), { Authorization: 'Bearer ' + t, 'Content-Type': 'application/json' }, body);
+    if (r.status !== 200) throw new Error('cloud write failed (' + r.status + ')');
+  }
+  async function cloudFsDelete(uid) {
+    const t = await cloudEnsureToken();
+    const body = JSON.stringify({ writes: [{ delete: cloudDocPath(uid) }] });
+    const r = await cloudRequest('POST', cloudCommitUrl(), { Authorization: 'Bearer ' + t, 'Content-Type': 'application/json' }, body);
+    if (r.status !== 200) throw new Error('cloud delete failed (' + r.status + ')');
+  }
+
+  function cloudBuildSnapshot() {
+    const snap = {};
+    for (const k of CLOUD_SYNC_KEYS) {
+      const v = Store.get(k, null);
+      if (typeof v === 'string' && v.length) snap[k] = v;
+    }
+    return snap;
+  }
+  // Writes a cloud snapshot into local storage, then re-reads every in-memory
+  // cache from storage and redraws - the same thing the cross-tab listener does,
+  // so adopted data shows with no page reload. Uses Store.set directly (not the
+  // save* wrappers) so it never triggers cloudTouch and loops back into a push.
+  function cloudApplySnapshot(snap) {
+    if (!snap || typeof snap !== 'object') return;
+    for (const k of CLOUD_SYNC_KEYS) {
+      if (typeof snap[k] === 'string') Store.set(k, snap[k]);
+    }
+    lots = loadLots();
+    settings = loadSettings();
+    logState = loadLogState();
+    pointsLots = loadPointsStats();
+    salesData = loadSales();
+    processedLogIds = loadProcessedLogIds();
+    processedLogIdSet = new Set(processedLogIds);
+    try { processedTrades = loadProcessedTrades(); } catch (e) { /* loaded later; fine */ }
+    try { if (typeof syncSettingsControls === 'function') syncSettingsControls(); } catch (e) { /* panel may not exist yet */ }
+    try { renderAll(); } catch (e) { /* panel may not exist yet */ }
+  }
+
+  async function cloudPush() {
+    const a = cloudLoadAuth(); if (!a) return;
+    const now = Date.now();
+    await cloudFsSet(a.uid, cloudBuildSnapshot(), now);
+    cloudSaveMeta({ ...cloudLoadMeta(), dataModifiedAt: now, lastSyncAt: now });
+  }
+  async function cloudPull() {
+    const a = cloudLoadAuth(); if (!a) return;
+    const cloud = await cloudFsGet(a.uid);
+    const localAt = Number(cloudLoadMeta().dataModifiedAt || 0);
+    if (cloud && cloud.updatedAt > localAt) {
+      cloudApplySnapshot(cloud.data);
+      cloudSaveMeta({ dataModifiedAt: cloud.updatedAt, lastSyncAt: Date.now() });
+    } else {
+      await cloudPush();
+    }
+  }
+  function cloudPushSoon() {
+    if (!cloudEnabled() || !cloudSignedIn()) return;
+    if (cloudPushTimer) clearTimeout(cloudPushTimer);
+    cloudPushTimer = setTimeout(() => { cloudPush().catch((e) => log('cloud push failed', e)); }, CLOUD_PUSH_DEBOUNCE_MS);
+  }
+  // The hook every saver calls. Stamps this device's data as freshly changed (so
+  // newest-wins favors it) and schedules a debounced push.
+  function cloudTouchImpl() {
+    if (!cloudEnabled() || !cloudSignedIn()) return;
+    const m = cloudLoadMeta(); m.dataModifiedAt = Date.now(); cloudSaveMeta(m);
+    cloudPushSoon();
+  }
+  function cloudInitFromLoad() {
+    if (!cloudEnabled() || !cloudSignedIn() || !cloudAvailable()) return;
+    cloudPull().catch((e) => log('cloud pull failed', e));
+  }
+  async function cloudEnable() {
+    const apiKey = getApiKey();
+    if (!apiKey) throw new Error('Save your Torn API key first, then turn on sync.');
+    if (cloudBusy) return; cloudBusy = true;
+    try {
+      if (!cloudSignedIn()) await cloudSignIn(apiKey);
+      setCloudEnabled(true);
+      const a = cloudLoadAuth();
+      const cloud = await cloudFsGet(a.uid);
+      // First enable: if a snapshot already exists (set up on another device),
+      // adopt it rather than clobbering it with this device's state. Otherwise
+      // this device seeds the cloud. Ongoing syncs then use newest-wins.
+      if (cloud && cloud.data && Object.keys(cloud.data).length) {
+        cloudApplySnapshot(cloud.data);
+        cloudSaveMeta({ dataModifiedAt: cloud.updatedAt, lastSyncAt: Date.now() });
+      } else {
+        await cloudPush();
+      }
+    } catch (e) {
+      setCloudEnabled(false); // roll back so a failed enable leaves sync genuinely off
+      throw e;
+    } finally { cloudBusy = false; }
+  }
+  async function cloudDisableAndDelete() {
+    setCloudEnabled(false);
+    if (cloudPushTimer) { clearTimeout(cloudPushTimer); cloudPushTimer = null; }
+    const a = cloudLoadAuth();
+    try { if (a) await cloudFsDelete(a.uid); } finally {
+      cloudSaveAuth(null); cloudIdToken = null; cloudIdTokenExpiry = 0; cloudSaveMeta({});
+    }
+  }
+  // Used by "Reset all data" when sync is on: wipe the cloud copy too so a local
+  // reset does not get silently restored from the cloud on the next load, and so
+  // the user's other devices clear as well. Sync stays on.
+  async function cloudWipe() {
+    const a = cloudLoadAuth(); if (!a) return;
+    if (cloudPushTimer) { clearTimeout(cloudPushTimer); cloudPushTimer = null; }
+    try { await cloudFsDelete(a.uid); } catch (e) { log('cloud wipe failed', e); }
+    cloudSaveMeta({ dataModifiedAt: Date.now(), lastSyncAt: Date.now() });
+  }
+
+  const CloudSync = {
+    enable: cloudEnable,
+    disableAndDelete: cloudDisableAndDelete,
+    wipe: cloudWipe,
+    initFromLoad: cloudInitFromLoad,
+    enabled: cloudEnabled,
+    signedIn: cloudSignedIn,
+    available: cloudAvailable,
+    get playerId() { const a = cloudLoadAuth(); return a ? a.playerId : null; },
+  };
+  // Wire the savers' no-op hook to the live implementation now that it exists.
+  cloudTouch = cloudTouchImpl;
 
   ////////////////////////////////////////////////////////////////////////////
   ////  LOT / HOLDINGS MODEL
@@ -1470,6 +1824,16 @@
           <div id="flipr-log-status" class="flipr-holding-meta"></div>
         </div>
         <div class="flipr-section">
+          <h4>Cloud sync</h4>
+          <div class="flipr-hint">Optional. Backs up your FLIPR data (holdings, sales, points, settings) to a private copy tied to your Torn ID, so your desktop and the Torn PDA stay in sync automatically. Your API key is NEVER uploaded, and the backup is deleted when you turn this off. Off until you turn it on.</div>
+          <label class="flipr-checkbox-row">
+            <input type="checkbox" id="flipr-cloud-sync">
+            Sync my FLIPR data across devices
+          </label>
+          <div id="flipr-cloud-status" class="flipr-holding-meta"></div>
+          <button class="flipr-btn flipr-btn-danger" id="flipr-cloud-delete" style="display:none;">Delete my cloud data</button>
+        </div>
+        <div class="flipr-section">
           <h4>Debug export</h4>
           <div class="flipr-hint">Share this with the script maintainer to help debug FLIPR - it includes your settings, holdings, and log-sync state. Your API key is NEVER included.</div>
           <button class="flipr-btn flipr-btn-block" id="flipr-debug-export-btn">Copy debug export</button>
@@ -2096,6 +2460,73 @@
   }
   renderApiKeySection();
 
+  // Cloud sync controls. The enabled flag is per-device (never synced), so turning
+  // it on here only ever affects THIS device, and always behind an explicit prompt.
+  function cloudRefreshStatus() {
+    const statusEl = $('#flipr-cloud-status');
+    const cb = $('#flipr-cloud-sync');
+    const del = $('#flipr-cloud-delete');
+    if (!statusEl || !cb) return;
+    if (!CloudSync.available()) {
+      cb.checked = false; cb.disabled = true;
+      statusEl.textContent = isPDA()
+        ? 'Not available in this PDA build (no network bridge).'
+        : 'Not available here (needs a userscript manager with GM_xmlhttpRequest).';
+      if (del) del.style.display = 'none';
+      return;
+    }
+    cb.disabled = false;
+    const on = CloudSync.enabled() && CloudSync.signedIn();
+    cb.checked = on;
+    if (on) {
+      const pid = CloudSync.playerId;
+      statusEl.textContent = pid ? ('On. Synced as player ' + pid + '.') : 'On.';
+      if (del) del.style.display = '';
+    } else {
+      statusEl.textContent = 'Off.';
+      if (del) del.style.display = 'none';
+    }
+  }
+  (function wireCloudSync() {
+    const cb = $('#flipr-cloud-sync');
+    const del = $('#flipr-cloud-delete');
+    if (!cb) return;
+    cb.addEventListener('change', async () => {
+      const statusEl = $('#flipr-cloud-status');
+      if (cb.checked) {
+        const ok = confirm(
+          'Turn on cloud sync?\n\n'
+          + 'FLIPR will back up your tracked data (holdings, sales, points, settings) '
+          + 'to a private copy tied to your Torn ID, so your desktop and the Torn PDA '
+          + 'stay in sync automatically.\n\n'
+          + 'Your API key is never uploaded. The backup is deleted when you turn sync off.'
+        );
+        if (!ok) { cb.checked = false; return; }
+        if (statusEl) statusEl.textContent = 'Connecting...';
+        try {
+          await CloudSync.enable();
+        } catch (e) {
+          cb.checked = false;
+          if (statusEl) statusEl.textContent = 'Could not turn on sync: ' + (e && e.message ? e.message : 'failed');
+          return;
+        }
+        cloudRefreshStatus();
+      } else {
+        if (statusEl) statusEl.textContent = 'Turning off and deleting cloud copy...';
+        try { await CloudSync.disableAndDelete(); } catch (e) { /* best effort; flag is already off */ }
+        cloudRefreshStatus();
+      }
+    });
+    if (del) {
+      del.addEventListener('click', async () => {
+        if (!confirm('Delete your cloud backup? This also turns sync off on this device.')) return;
+        try { await CloudSync.disableAndDelete(); } catch (e) { /* best effort */ }
+        cloudRefreshStatus();
+      });
+    }
+    cloudRefreshStatus();
+  })();
+
   // Snapshot of non-sensitive state, meant to be pasted to the script
   // maintainer for debugging - never includes the API key itself, only
   // whether one is set. See the COMPLIANCE NOTE at the top of the file.
@@ -2513,7 +2944,11 @@
   );
 
   $('#flipr-reset-btn').addEventListener('click', () => {
-    if (!confirm('Clear all FLIPR purchase and sales history? This cannot be undone.')) return;
+    const cloudOn = CloudSync.enabled() && CloudSync.signedIn();
+    const msg = cloudOn
+      ? 'Clear all FLIPR purchase and sales history? This also deletes your cloud backup and clears your other synced devices. This cannot be undone.'
+      : 'Clear all FLIPR purchase and sales history? This cannot be undone.';
+    if (!confirm(msg)) return;
     lots = [];
     Store.del(STORAGE_KEY); // loadLots() already defaults to [] when the key is absent, same end state as saving '[]'
     resetPointsStats();
@@ -2526,6 +2961,9 @@
     Store.del(PROCESSED_LOG_IDS_KEY);
     recentlyLoggedDomFingerprints.clear();
     Store.del(PENDING_TICKETS_KEY);
+    // If sync is on, wipe the cloud copy too so this reset is not silently
+    // restored on the next load and the user's other devices clear as well.
+    if (cloudOn) CloudSync.wipe().catch((e) => log('cloud wipe after reset failed', e));
     renderAll();
   });
 
@@ -3744,6 +4182,7 @@ yasukuni sword|65|70|49|54
     if (processedTrades.length > 500) processedTrades = processedTrades.slice(-500);
     try {
       Store.set(PROCESSED_TRADES_KEY, JSON.stringify(processedTrades));
+      cloudTouch();
     } catch (e) {
       log('markTradeProcessed save failed', e);
     }
@@ -4830,6 +5269,10 @@ yasukuni sword|65|70|49|54
   }
 
   startLogPolling();
+
+  // If the user has cloud sync on, reconcile with their cloud copy now that all
+  // in-memory state and the panel are up (newest-device-wins; see CLOUD SYNC).
+  CloudSync.initFromLoad();
 
   // Buy-page click handler: captures a clicked card's Damage/Accuracy/Armor (Item
   // Market AND bazaar) and, on the Item Market only, shows the after-5%-tax chip
