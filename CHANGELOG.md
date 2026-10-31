@@ -4,6 +4,9 @@ Patch notes for FLIPR, a bazaar-flip profit tracker userscript for Torn. Created
 
 ---
 
+## v2.45.2
+- **Fix: on the PDA (and narrow screens) the pop-up confirmations were landing off the left edge.** The toast that confirms a logged buy/sale was positioned for a desktop layout, so on a phone-width screen it hung off the left side with only a sliver showing in the top-left corner. It now spans the width of a narrow screen with a small margin, so it's fully visible. Desktop placement is unchanged.
+
 ## v2.45.1
 - **Diagnostics patch: a player-to-player trade that silently fell through now leaves a trace.** v2.45.0 could still miss the one case where a trade stops being tracked *before* FLIPR ever prices it - if Torn's trade page doesn't carry the trade id where FLIPR looks for it, the trade quietly dropped with nothing recorded at all. FLIPR now notes that it happened, which gate it stopped at, and the shape of the trade page's address (every number masked out), so a trade that "isn't tracked" can be diagnosed in one step instead of guessing. How FLIPR tracks your trades is unchanged.
 - **Same privacy bar as the rest of the diagnostics.** The address shape has every digit replaced with a placeholder before anything is saved, so no trade id or value is ever kept - it only shows the page's layout. Still diagnostics only, and your API key is still never uploaded.

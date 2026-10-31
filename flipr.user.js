@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FLIPR: Flip Profit Tracker
 // @namespace    http://torn.city.com.dot.com.com
-// @version      2.45.1
+// @version      2.45.2
 // @description  Automatically logs what you paid for bazaar/item market purchases (via your own Torn API key) and warns you before you list them for less than a real profit, accounting for Torn's item market sales tax
 // @updateURL    https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
 // @downloadURL  https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
@@ -61,7 +61,7 @@
   ////////////////////////////////////////////////////////////////////////////
 
   const DEBUG = false;
-  const SCRIPT_VERSION = '2.45.1';
+  const SCRIPT_VERSION = '2.45.2';
 
   const STORAGE_KEY = 'flipr_lots_v1';
   const SETTINGS_KEY = 'flipr_settings_v1';
@@ -1779,6 +1779,12 @@
     .flipr-toast-close { position: absolute; top: 4px; right: 6px; color: #888; font-size: 13px;
       line-height: 1; cursor: pointer; }
     .flipr-toast-close:hover { color: #ccc; }
+    /* PDA / narrow viewports: the desktop "right: 320px" (clears the side panel) pushes
+       a 260px toast off the LEFT edge on a ~390px screen - only a sliver shows top-left.
+       On small screens span the width with small margins so the toast is fully visible. */
+    @media (max-width: 640px) {
+      .flipr-toast { top: 6px; left: 6px; right: 6px; max-width: none; }
+    }
     .flipr-fee-toggle { display: flex; flex-wrap: wrap; gap: 6px 10px; font-size: 11px; color: #bbb; margin-bottom: 8px; }
     .flipr-fee-toggle label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
     .flipr-hint { color: #888; font-size: 10px; margin: 2px 0 8px; }
