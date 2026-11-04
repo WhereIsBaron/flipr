@@ -1,0 +1,36 @@
+# FLIPR public repo.
+# Only these belong here: flipr.user.js, LICENSE, README.txt, .gitignore.
+# Everything else stays on the PC / in the private repo and is ignored below.
+
+# --- Secrets / credentials: never in a public, auto-pushed repo ---
+cloud/
+*.pem
+*.key
+*serviceaccount*.json
+*adminsdk*.json
+.env
+.env.*
+*.secret
+secrets.*
+
+# --- Private dev docs & listings (live only in the private repo / on the PC) ---
+README.md
+CHANGELOG.md
+CHANGELOG_*.html
+CHANGELOG_*.md
+*LISTING*.md
+HANDOVER*.md
+ROADMAP*.md
+*_SPEC.md
+NOTES*.md
+
+# --- Local junk ---
+*.bak
+*.tmp
+*.log
+backups/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
