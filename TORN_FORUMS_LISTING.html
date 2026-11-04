@@ -1,0 +1,76 @@
+<p><strong>CURRENT VERSION: FLIPR v2.46.0</strong></p>
+
+<p><strong>[ INSTALL - FLIPR: FLIP PROFIT TRACKER ]</strong></p>
+
+<p><strong>SUPPORTS PDA &#10004;</strong></p>
+
+<p>You buy cheap, list it, and once Torn's 5% tax lands the "profit" is a loss. FLIPR tracks what you paid, warns you before you list too low, and shows your real profit over time.</p>
+
+<p>Small floating panel. No spreadsheets, no manual entry. Works on desktop and on the Torn PDA.</p>
+
+<h3>What it does</h3>
+
+<ul>
+  <li><strong>Logs your buys automatically</strong> - Item Market, Bazaar, Points Market. Nothing to type in.</li>
+  <li><strong>Holdings</strong> - what you paid per item, and your breakeven price after tax.</li>
+  <li><strong>Profits tab</strong> - your realized profit over time, matched against what each item cost you.</li>
+  <li><strong>Sell Check</strong> - type a price and quantity, see profit or loss instantly (5% market, 15% anonymous, 0% bazaar).</li>
+  <li><strong>Breakeven warning while listing</strong> - catches a price below breakeven before you submit.</li>
+  <li><strong>Quality at a glance</strong> - every weapon and armour shows a "Q %" quality badge and its bonuses, across the Item Market, the Bazaar, your Items page, and any Display Case.</li>
+  <li><strong>Item Market quality filter</strong> - set a minimum Q % (and, optionally, a bonus name) and matching listings light up. Highlight-only: nothing is hidden or reordered.</li>
+  <li><strong>Weapon stats per copy</strong> - records each weapon's own Damage and Accuracy, so two of the same name stay separate.</li>
+  <li><strong>After-tax helper</strong> - click an Item Market listing to see its price minus the 5% tax.</li>
+  <li><strong>Points tracker</strong> - its own tab for Points Market buys.</li>
+  <li><strong>Optional cloud sync</strong> - off by default. Turn it on to keep your desktop and PDA in step; your own tracked data (never your key) is mirrored to a private copy tied to your Torn ID.</li>
+</ul>
+
+<h3>Read-only, fully within the rules</h3>
+
+<p>It never clicks, submits, or fills anything for you. It only reads your own official API log (with a key you create yourself) and the numbers Torn already shows, then displays its own figures in its own panel. Nothing leaves your browser except calls to Torn's own API, with your key, for your own account - plus the optional cloud sync above, which stays off until you turn it on.</p>
+
+<hr>
+
+<h3>API Terms of Service</h3>
+
+<p>Your API key never leaves your device - it is used only for Torn's own API. Your tracked data stays in your own browser by default; the only thing that can leave is your own data, to your own private cloud-sync copy, and only if you switch cloud sync on.</p>
+
+<table border="1" cellpadding="6" cellspacing="0">
+  <thead>
+    <tr>
+      <th>Data Storage</th>
+      <th>Data Sharing</th>
+      <th>Purpose of Use</th>
+      <th>Key Storage &amp; Sharing</th>
+      <th>Key Access Level</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>In your own browser. Optional cloud sync (off by default) also keeps a private copy tied to your Torn ID.</td>
+      <td>Not shared with anyone. By default only Torn's own API is contacted; with cloud sync on, your own data syncs to a private store readable only as your Torn ID.</td>
+      <td>Assistive use only; only you can access your data.</td>
+      <td>Stored locally only; never uploaded or shared, even with cloud sync on.</td>
+      <td>Custom (see below)</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>Selections used: <code>user</code> -&gt; <code>basic</code> (your player id, so cloud sync can confirm the key is yours), <code>user</code> -&gt; <code>log</code> (your own buys and sells), and <code>torn</code> -&gt; <code>items</code> (item names). Nothing else is requested. <strong>You do not need to give FLIPR a Full Access key</strong> - use the custom key link below, or the "Make a FLIPR-only key" button inside Settings, which opens the same thing with the boxes already ticked:</p>
+
+<p><strong>[ Custom FLIPR API KEY ]</strong></p>
+
+<p><a href="https://www.torn.com/preferences.php#tab=api?step=addNewKey&amp;title=FLIPR&amp;user=basic,log&amp;torn=items">https://www.torn.com/preferences.php#tab=api?step=addNewKey&amp;title=FLIPR&amp;user=basic,log&amp;torn=items</a></p>
+
+<hr>
+
+<h3>Install</h3>
+
+<p><strong>Desktop:</strong> install Tampermonkey or Violentmonkey, then open <a href="https://greasyfork.org/en/scripts/585457-flipr-flip-profit-tracker">https://greasyfork.org/en/scripts/585457-flipr-flip-profit-tracker</a> and click Install.</p>
+
+<p><strong>Torn PDA:</strong> Settings &gt; User scripts &gt; add the same link. Nothing to paste - the PDA supplies its own key.</p>
+
+<h3>Bugs and feedback</h3>
+
+<p>Settings has a "Copy debug export" button - it copies a snapshot with your API key stripped out (source and length only, never the key itself). Send it, or any suggestions, to The_Baron [1467784].</p>
+
+<p>Free to use. MIT licensed. Happy flipping.</p>
