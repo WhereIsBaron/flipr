@@ -76,8 +76,5 @@ Send that to The_Baron [1467784] on Torn.
 
 LICENSE
 ----------------------------------------------------------------
-Copyright (c) 2026 The_Baron [1467784]. All rights reserved.
-Personal, non-commercial use is permitted; any other use (copying, modifying,
-forking, redistributing, or reusing the code) requires prior written permission,
-and commercial use is not allowed without permission. See the LICENSE file for
-the full terms.
+FLIPR is free and open source, MIT licensed.
+Copyright (c) 2026 The_Baron [1467784]. See the LICENSE file for the full terms.
