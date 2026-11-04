@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FLIPR: Flip Profit Tracker
 // @namespace    http://torn.city.com.dot.com.com
-// @version      2.45.2
+// @version      2.46.0
 // @description  Automatically logs what you paid for bazaar/item market purchases (via your own Torn API key) and warns you before you list them for less than a real profit, accounting for Torn's item market sales tax
 // @updateURL    https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
 // @downloadURL  https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
@@ -61,7 +61,7 @@
   ////////////////////////////////////////////////////////////////////////////
 
   const DEBUG = false;
-  const SCRIPT_VERSION = '2.45.2';
+  const SCRIPT_VERSION = '2.46.0';
 
   const STORAGE_KEY = 'flipr_lots_v1';
   const SETTINGS_KEY = 'flipr_settings_v1';
@@ -364,6 +364,16 @@
         // Record completed player trades (trade.php) as buys/sales (see the PLAYER
         // TRADE LOG section). On by default.
         trackTrades: typeof parsed.trackTrades === 'boolean' ? parsed.trackTrades : true,
+        // Manual-scan mode. When ON, FLIPR does NOT run the repeating API log
+        // poll and does NOT poll on page load - the capture path is the instant
+        // on-page detection (if that box is on, it catches a buy the moment it
+        // happens) plus an explicit "Scan now" button for a full on-demand
+        // reconcile. When OFF, FLIPR also polls the log every few seconds as
+        // before. Defaults ON for the Torn PDA (where the constant polling is
+        // the main cause of the reported slowdown) and OFF on desktop, so no
+        // desktop install changes behavior. User-overridable either way. See
+        // MANUAL SCAN / the Purchase detection settings.
+        manualScan: typeof parsed.manualScan === 'boolean' ? parsed.manualScan : isPDA(),
         // How the launcher is shown. 'float' is the classic draggable button
         // that collapses to a round puck you can park anywhere. 'docked' hides
         // that puck and instead wedges an open/close button into Torn's bottom
@@ -394,7 +404,7 @@
         panelSize: readPanelSize(parsed.panelSize),
       };
     } catch (e) {
-      return { feeMode: 'bazaar', collapsed: false, scanPageText: true, holdingsMode: 'separate', marketTaxHelper: true, marketQuality: true, trackTrades: true, launcherMode: 'float', dockIndex: null, activeTab: 'main', panelPos: null, collapsedPos: null, panelSize: null };
+      return { feeMode: 'bazaar', collapsed: false, scanPageText: true, holdingsMode: 'separate', marketTaxHelper: true, marketQuality: true, trackTrades: true, manualScan: isPDA(), launcherMode: 'float', dockIndex: null, activeTab: 'main', panelPos: null, collapsedPos: null, panelSize: null };
     }
   }
 
@@ -942,9 +952,30 @@
     const m = cloudLoadMeta(); m.dataModifiedAt = Date.now(); cloudSaveMeta(m);
     cloudPushSoon();
   }
+  // Min gap between automatic cloud reconciles on the PDA (see cloudInitFromLoad).
+  const CLOUD_PULL_MIN_INTERVAL_MS = 3 * 60 * 1000;
   function cloudInitFromLoad() {
     if (!cloudEnabled() || !cloudSignedIn() || !cloudAvailable()) return;
+    // Manual-scan mode: the cloud reconcile waits for the "Scan now" button,
+    // never on load.
+    if (settings.manualScan) return;
+    // On the PDA, throttle the reconcile: this device's local copy is already
+    // the authoritative fast path, so pulling on EVERY page load just adds a
+    // network round-trip to each reload (a reported slowdown source). Pull at
+    // most once per window. Desktop is unchanged - it pulls on every load as
+    // before, so cross-device freshness there is untouched; the local-first
+    // load path is instant either way.
+    if (isPDA()) {
+      const lastSync = Number(cloudLoadMeta().lastSyncAt || 0);
+      if (lastSync && (Date.now() - lastSync) < CLOUD_PULL_MIN_INTERVAL_MS) return;
+    }
     cloudPull().catch((e) => log('cloud pull failed', e));
+  }
+  // Forced reconcile for the "Scan now" button - ignores the throttle and the
+  // manual-mode skip above (the whole point of the tap is to sync now).
+  function cloudPullNow() {
+    if (!cloudEnabled() || !cloudSignedIn() || !cloudAvailable()) return Promise.resolve();
+    return cloudPull().catch((e) => log('cloud pull failed', e));
   }
   async function cloudEnable() {
     const apiKey = getApiKey();
@@ -992,6 +1023,7 @@
     disableAndDelete: cloudDisableAndDelete,
     wipe: cloudWipe,
     initFromLoad: cloudInitFromLoad,
+    pullNow: cloudPullNow,
     enabled: cloudEnabled,
     signedIn: cloudSignedIn,
     available: cloudAvailable,
@@ -1899,6 +1931,13 @@
             Instant purchase detection
           </label>
           <div class="flipr-hint">Logs a buy the second it happens on the Bazaar/Item Market/Points Market pages themselves - turn off to use only the slower, safer API check.</div>
+          <label class="flipr-checkbox-row">
+            <input type="checkbox" id="flipr-manual-scan">
+            Manual scan (scan on a button, not constantly)
+          </label>
+          <div class="flipr-hint">On (default on the Torn PDA): stops the constant background API polling and the scan-on-every-refresh. Buys are still caught instantly on the page as they happen (if the box above is on), and the button below runs a full log check on demand. Off (default on desktop): FLIPR also polls your log every few seconds. Changing this takes effect on the next page load.</div>
+          <button type="button" id="flipr-scan-now" class="flipr-btn">Scan now</button>
+          <div id="flipr-scan-now-status" class="flipr-hint"></div>
         </div>
         <div class="flipr-section">
           <h4>Market tools</h4>
@@ -2426,6 +2465,30 @@
     settings.scanPageText = e.target.checked;
     saveSettings(settings);
     refreshStatusLine();
+  });
+
+  $('#flipr-manual-scan').checked = settings.manualScan;
+  $('#flipr-manual-scan').addEventListener('change', (e) => {
+    settings.manualScan = e.target.checked;
+    saveSettings(settings);
+    refreshStatusLine();
+  });
+
+  // One-tap full reconcile for manual-scan mode: fetch the API log now, read the
+  // open trade if we are on trade.php, and (if cloud sync is on) pull the cloud
+  // copy now, bypassing the load throttle. pollLog/readTradeLog/CloudSync are all
+  // defined in this IIFE and in scope by the time this click can fire.
+  $('#flipr-scan-now').addEventListener('click', () => {
+    const statusEl = $('#flipr-scan-now-status');
+    if (!getApiKey()) {
+      if (statusEl) statusEl.textContent = 'Save your Torn API key (below) first, then Scan now.';
+      return;
+    }
+    if (statusEl) statusEl.textContent = 'Scanning...';
+    try { pollLog(); } catch (e) { log('manual Scan now: pollLog failed', e); }
+    try { if (/\/trade\.php/i.test(location.pathname)) readTradeLog(); } catch (e) { log('manual Scan now: readTradeLog failed', e); }
+    try { if (CloudSync && CloudSync.pullNow) CloudSync.pullNow(); } catch (e) { log('manual Scan now: cloud pull failed', e); }
+    if (statusEl) setTimeout(() => { statusEl.textContent = 'Last scan: ' + new Date().toLocaleTimeString(); }, 50);
   });
 
   $('#flipr-market-tax').checked = settings.marketTaxHelper;
@@ -4242,8 +4305,14 @@ yasukuni sword|65|70|49|54
     // Travel page: the foreign shops abroad are where plushies and flowers get bought for
     // resale, and those purchases confirm right on this page.
     if (/\/page\.php/i.test(path) && /sid=travel/i.test(search)) return true;
-    // City shops (Nikeh, Big Al's and the rest) use their own page.
+    // City shops (Nikeh and the rest) use their own page.
     if (/\/shops\.php/i.test(path)) return true;
+    // Big Al's Gun Shop is a separate page, NOT under shops.php (reported gap).
+    if (/\/bigalgunshop\.php/i.test(path)) return true;
+    // amarket.php - on the user's list of pages FLIPR should run on. Capture
+    // already works there via the API log; this enables the instant on-page
+    // toast and the quality badges on it too.
+    if (/\/amarket\.php/i.test(path)) return true;
     return false;
   }
 
@@ -4560,23 +4629,33 @@ yasukuni sword|65|70|49|54
     }, 700);
   }
 
-  // Persistent trade-log watcher: attach ONE body-scoped observer unconditionally and
-  // redraw on hashchange/popstate/pushState, so a completed trade is caught however
-  // you arrive at it (fresh load, Past-Trades click, or in-site navigation).
-  window.addEventListener('hashchange', () => scanTradeLog());
-  window.addEventListener('popstate', () => scanTradeLog());
-  try {
-    new MutationObserver(() => scanTradeLog())
-      .observe(document.body || document.documentElement, { childList: true, subtree: true });
-  } catch (e) {
-    log('trade observer attach failed', e);
+  // Persistent trade-log watcher. This used to attach a body-scoped subtree
+  // MutationObserver (plus hashchange/popstate/pushState hooks) on EVERY Torn
+  // page, firing scanTradeLog() on every DOM mutation site-wide - the single
+  // biggest source of the PDA slowdown, since scanTradeLog only ever does
+  // anything on trade.php and returned a no-op everywhere else while still
+  // paying the observer cost. Now the whole watcher attaches only on trade.php,
+  // so every non-trade page carries none of it. A completed trade is still
+  // caught however you arrive at it (fresh load, Past-Trades click, or in-site
+  // navigation) because that navigation lands you on trade.php, where this
+  // arms. The short bounded trade poll (startTradePoll, trade.php-gated) remains
+  // the safety net for in-sandbox nav events that can miss (the v2.41.0 reason).
+  if (/\/trade\.php/i.test(location.pathname)) {
+    window.addEventListener('hashchange', () => scanTradeLog());
+    window.addEventListener('popstate', () => scanTradeLog());
+    try {
+      new MutationObserver(() => scanTradeLog())
+        .observe(document.body || document.documentElement, { childList: true, subtree: true });
+    } catch (e) {
+      log('trade observer attach failed', e);
+    }
+    try {
+      const wrapHist = (orig) => function () { const r = orig.apply(this, arguments); try { scanTradeLog(); } catch (e) { /* ignore */ } return r; };
+      history.pushState = wrapHist(history.pushState);
+      history.replaceState = wrapHist(history.replaceState);
+    } catch (e) { /* history not writable - hashchange + observer still cover most cases */ }
+    scanTradeLog();
   }
-  try {
-    const wrapHist = (orig) => function () { const r = orig.apply(this, arguments); try { scanTradeLog(); } catch (e) { /* ignore */ } return r; };
-    history.pushState = wrapHist(history.pushState);
-    history.replaceState = wrapHist(history.replaceState);
-  } catch (e) { /* history not writable - hashchange + observer still cover most cases */ }
-  scanTradeLog();
 
   ////////////////////////////////////////////////////////////////////////////
   ////  MARKET TAX HELPER (click a listing -> price minus 5% tax, with Copy)
@@ -5028,10 +5107,21 @@ yasukuni sword|65|70|49|54
   // 'points market' is a guess at the category string, unverified against a
   // real log entry - if it's wrong this category just never matches (falls
   // through to the normal "skipped" diagnostic list below), no harm done.
-  // 'shops' covers BOTH the foreign travel shops and the city shops - Torn files them
-  // under one category ("Item shop buy", type 4200) with an `area` field distinguishing
-  // them. Confirmed from a real log entry.
+  // 'shops' covers the city shops - Torn files them under category "Item shop buy"
+  // (type 4200) with an `area` field. A real sample was area:103 (a city shop).
   const PURCHASE_LOG_CATEGORIES = new Set(['item market', 'bazaars', 'points market', 'shops']);
+
+  // Flat single-item shop buys, recognized by EXACT log-type id rather than the
+  // category string. 4200 = "Item shop buy" (city shops). 4201 = "Item abroad Buy"
+  // (foreign/travel shops) is a DISTINCT type whose category string was NOT verified
+  // to be 'shops' - the earlier code assumed one 'shops' category covered abroad too,
+  // which would silently skip 4201 on the API path (a suspect for the reported
+  // "missed some purchases"). Matching by type id makes the flat-shop branch below
+  // fire for abroad buys whatever category string Torn stamps on them. Both share the
+  // flat { item, quantity, cost_each, cost_total, area } data shape. If a live 4201
+  // pull later shows a different shape, add an explicit branch; type-id recognition
+  // is still correct for routing it here instead of dropping it as "not a purchase".
+  const FLAT_SHOP_LOG_TYPE_IDS = new Set([4200, 4201]);
 
   // data.log turned out ambiguous from a browser JSON-tree view alone - it
   // could be a real array or an object keyed by opaque/numeric-looking IDs
@@ -5075,6 +5165,10 @@ yasukuni sword|65|70|49|54
       const category = String(details.category || '').toLowerCase();
       const title = String(details.title || '').toLowerCase();
       const typeId = Number(details.id);
+      // A city-shop (4200) or abroad (4201) buy, recognized by type id. These
+      // bypass the category/title purchase gate below so an abroad buy whose
+      // category string is not 'shops' is still captured, not skipped.
+      const isFlatShopType = FLAT_SHOP_LOG_TYPE_IDS.has(typeId);
 
       // Sales (realized profit) are detected by EXACT log-type id, confirmed off the
       // live log - no title-regex guessing. Claim the id first (same rule as buys)
@@ -5101,7 +5195,7 @@ yasukuni sword|65|70|49|54
       // Matches "buy" or "purchase" in the title - the only confirmed real
       // sample used "Item market buy", but a Bazaar purchase's exact title
       // has never been observed live, so this stays deliberately broad.
-      if (!PURCHASE_LOG_CATEGORIES.has(category) || !/buy|purchase/.test(title)) {
+      if (!isFlatShopType && (!PURCHASE_LOG_CATEGORIES.has(category) || !/buy|purchase/.test(title))) {
         if (skipped.length < 20) skipped.push({ title: details.title, category: details.category });
         log('log entry skipped (not a purchase)', details.title, details.category);
         continue;
@@ -5138,7 +5232,13 @@ yasukuni sword|65|70|49|54
       // confirmed from a real "Item shop buy" (type 4200) entry. Same flat shape as the
       // points market, and handled here for the same reason: without it, every shop
       // purchase falls into the "no items[] array" skip below and is lost silently.
-      if (category === 'shops') {
+      // Also handles abroad buys (type 4201) via isFlatShopType, even if their
+      // category string is not 'shops' - see FLAT_SHOP_LOG_TYPE_IDS above.
+      if (category === 'shops' || isFlatShopType) {
+        // Dedicated counter so a post-rollout debug export can confirm abroad
+        // buys are being caught on the API path (closes the "missed purchases"
+        // question with evidence rather than a guess).
+        if (typeId === 4201) Diag.bump('abroadSeen');
         const data = entry.data || {};
         const qty = Number(data.quantity) || 0;
         const unitCost = Number(data.cost_each ?? (data.cost_total != null && qty ? data.cost_total / qty : NaN));
@@ -5270,6 +5370,12 @@ yasukuni sword|65|70|49|54
   // start cannot miss a purchase.
   const POLL_START_DELAY_MS = 4000;
   function startLogPolling() {
+    // Manual-scan mode (PDA default): no poll on page load and no repeating
+    // interval - this is the "scan on a button, not constantly / not a random
+    // scan on every refresh" request. Capture is the instant on-page detection
+    // (if on, it catches a buy as it happens) plus the "Scan now" button, which
+    // runs pollLog() on demand. Desktop (manualScan off) is unchanged.
+    if (settings.manualScan) return;
     setTimeout(() => {
       pollLog();
       setInterval(pollLog, LOG_POLL_INTERVAL_MS);
