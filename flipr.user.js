@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FLIPR: Flip Profit Tracker
 // @namespace    http://torn.city.com.dot.com.com
-// @version      2.46.0
+// @version      2.47.0
 // @description  Automatically logs what you paid for bazaar/item market purchases (via your own Torn API key) and warns you before you list them for less than a real profit, accounting for Torn's item market sales tax
 // @updateURL    https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
 // @downloadURL  https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
@@ -61,7 +61,7 @@
   ////////////////////////////////////////////////////////////////////////////
 
   const DEBUG = false;
-  const SCRIPT_VERSION = '2.46.0';
+  const SCRIPT_VERSION = '2.47.0';
 
   const STORAGE_KEY = 'flipr_lots_v1';
   const SETTINGS_KEY = 'flipr_settings_v1';
@@ -1617,9 +1617,16 @@
 
   // Confirmed sell log-entry types (numeric details.id, read off the live log):
   // 1113 Item market sell, 1104 its legacy variant, 1226 Bazaar sell, 1221 its
-  // legacy variant, 5011 Points market sell.
-  const SALE_LOG_TYPE_IDS = new Set([1113, 1104, 1226, 1221, 5011]);
-  const SALE_TYPE_MARKET = { 1113: 'item', 1104: 'item', 1226: 'bazaar', 1221: 'bazaar', 5011: 'points' };
+  // legacy variant, 5011 Points market sell, 4210 Item shop sell (city shops).
+  // 4210 is the sell counterpart of the shop BUY types (4200 city / 4201 abroad):
+  // a FLAT single-item entry { item, quantity, value_each, total_value, area },
+  // handled by the 'shop' branch in processSaleEntry. NPC shops take no tax, so
+  // proceeds == total_value and there is no fee. Field names differ from a shop
+  // BUY (value_each/total_value here, vs cost_each/cost_total for a buy). The
+  // abroad/travel shop SELL id has NOT been sampled yet (as 4201 was for buys);
+  // add it here once seen off a live log, same exact-id way - no title guessing.
+  const SALE_LOG_TYPE_IDS = new Set([1113, 1104, 1226, 1221, 5011, 4210]);
+  const SALE_TYPE_MARKET = { 1113: 'item', 1104: 'item', 1226: 'bazaar', 1221: 'bazaar', 5011: 'points', 4210: 'shop' };
 
   // Turn one confirmed sale log entry into a ledger record, then refresh the panel
   // and toast it. Returns the record (truthy) so the caller can count it, or null if
@@ -1637,6 +1644,17 @@
       const proceeds = Number(d.cost_total ?? (d.cost_each != null && qty ? d.cost_each * qty : NaN));
       if (!(qty > 0) || !Number.isFinite(proceeds)) return null;
       rec = recordSale('Points', qty, proceeds, 0, 'points', ts);
+    } else if (market === 'shop') {
+      // City shop sell (type 4210): FLAT shape { item, quantity, value_each,
+      // total_value, area }, the sell counterpart of a shop BUY. NPC shops take
+      // no tax, so proceeds == total_value and the fee is 0. Note the field names
+      // differ from a shop BUY (value_each/total_value here, vs cost_each/
+      // cost_total for a buy). There is no uid, so the cost basis matches by name
+      // (FIFO over this item's lots), exactly like a stackable market sell.
+      const qty = Number(d.quantity) || 0;
+      const proceeds = Number(d.total_value ?? (d.value_each != null && qty ? d.value_each * qty : NaN));
+      if (!(qty > 0) || !Number.isFinite(proceeds) || d.item == null) return null;
+      rec = recordSale(resolveItemName(d.item), qty, proceeds, 0, 'shop', ts);
     } else {
       // Item market / bazaar: items[] holds {id, qty} but the MONEY is at entry level
       // (cost_total is NET, `fee` is the tax) - NOT inside items[]. Every sampled sell
