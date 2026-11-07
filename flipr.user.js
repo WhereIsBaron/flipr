@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FLIPR: Flip Profit Tracker
 // @namespace    http://torn.city.com.dot.com.com
-// @version      2.47.0
+// @version      2.48.0
 // @description  Automatically logs what you paid for bazaar/item market purchases (via your own Torn API key) and warns you before you list them for less than a real profit, accounting for Torn's item market sales tax
 // @updateURL    https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
 // @downloadURL  https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
@@ -61,7 +61,7 @@
   ////////////////////////////////////////////////////////////////////////////
 
   const DEBUG = false;
-  const SCRIPT_VERSION = '2.47.0';
+  const SCRIPT_VERSION = '2.48.0';
 
   const STORAGE_KEY = 'flipr_lots_v1';
   const SETTINGS_KEY = 'flipr_settings_v1';
@@ -1298,6 +1298,42 @@
   // Escape cancels. Commit-on-blur is deliberate: the common case is typing a number and
   // clicking back onto the page, and losing that silently would be worse than the rare
   // accidental save, which Escape and a re-edit both undo.
+  // Click a "no basis" sale row to record what the item actually cost you - loot, old
+  // stock, pre-install, gifts: anything FLIPR never logged a buy for. DISPLAY-ONLY: it
+  // shows a real profit on the row (proceeds - cost) but is deliberately kept OUT of the
+  // frozen lifetime Realized total, so the headline number stays forward-only. Blank
+  // clears it back to "no basis"; 0 means it was genuinely free. rec is the live record
+  // from salesData.recent (renderProfits spreads the array but keeps object refs), so
+  // mutating it here and calling saveSales persists the change.
+  function startManualCostEdit(metaSpan, rec) {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'flipr-price-edit';
+    input.value = Number.isFinite(Number(rec.manualCost)) ? String(Math.round(Number(rec.manualCost))) : '';
+    input.placeholder = 'cost basis';
+    input.title = 'Enter to save, Escape to cancel, blank to clear';
+    metaSpan.replaceWith(input);
+    input.focus();
+    input.select();
+    let done = false;
+    const finish = (commit) => {
+      if (done) return;
+      done = true;
+      if (commit) {
+        const raw = String(input.value).trim();
+        if (raw === '') delete rec.manualCost;
+        else rec.manualCost = Math.max(0, Number(raw.replace(/[^0-9.]/g, '')) || 0);
+        saveSales(salesData);
+      }
+      renderAll();
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+      else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    });
+    input.addEventListener('blur', () => finish(true));
+  }
+
   function startPriceEdit(metaSpan, entry) {
     const input = document.createElement('input');
     input.type = 'text';
@@ -3263,11 +3299,25 @@
       const metaSpan = document.createElement('span');
       metaSpan.className = 'flipr-holding-meta';
       let metaText;
+      const DOT = String.fromCharCode(0xB7);
+      const noBasis = rec.matchedQty === 0;
+      const manualCost = noBasis ? Number(rec.manualCost) : NaN;
+      const hasManualCost = Number.isFinite(manualCost);
+      const adjProfit = hasManualCost ? (rec.proceeds - manualCost) : rec.profit;
+      if (noBasis) {
+        metaSpan.style.cursor = 'pointer';
+        metaSpan.title = 'Click to set what this cost you';
+        metaSpan.addEventListener('click', () => startManualCostEdit(metaSpan, rec));
+      }
       if (rec.matchedQty > 0) {
         const sign = rec.profit >= 0 ? '+' : '';
         metaSpan.style.color = rec.profit >= 0 ? '#6c6' : '#e66';
         const partial = rec.matchedQty < rec.qty ? ` (${rec.matchedQty}/${rec.qty})` : '';
         metaText = `${sign}${money(rec.profit)}${partial}${formatStats(rec.stats)}`;
+      } else if (hasManualCost) {
+        const sign = adjProfit >= 0 ? '+' : '';
+        metaSpan.style.color = adjProfit >= 0 ? '#6c6' : '#e66';
+        metaText = `${sign}${money(adjProfit)} ${DOT} basis ${money(manualCost)}${formatStats(rec.stats)}`;
       } else {
         metaText = `${money(rec.proceeds)} \u00B7 no basis`;
       }
