@@ -1651,6 +1651,87 @@
     Store.del(SALES_KEY);
   }
 
+  // ---------------------------------------------------------------------------
+  // One-time maintenance: undo trades that were auto-logged just from VIEWING an
+  // old completed-trade page before the recency gate landed (the "opening an old
+  // trade re-logs it" bug). Trade buys carry source 'trade:<id>' and trade sells
+  // carry market 'trade', so both are identifiable. Exposed on the page as
+  // window.fliprCleanupOldTrades so it can be run by hand from the console. It is
+  // a DRY RUN by default (lists what it would remove, changes nothing); apply makes
+  // a full backup of lots+sales first so it is fully reversible.
+  //   fliprCleanupOldTrades()                 - preview only
+  //   fliprCleanupOldTrades({ apply: true })  - remove them (backs up first)
+  //   fliprCleanupOldTrades({ restore: true })- put the backup back
+  const TRADE_CLEANUP_BACKUP_KEY = 'flipr_trade_cleanup_backup_v1';
+  function cleanupOldTrades(opts) {
+    opts = opts || {};
+    const C = 'color:#4cc3ff;font-weight:bold';
+
+    if (opts.restore) {
+      let snap = null;
+      try { snap = JSON.parse(Store.get(TRADE_CLEANUP_BACKUP_KEY, '') || 'null'); } catch (e) { /* ignore */ }
+      if (!snap || !Array.isArray(snap.lots) || !snap.sales) { console.log('%c[FLIPR cleanup] no backup to restore', 'color:#e66'); return; }
+      lots = snap.lots;
+      salesData = snap.sales;
+      saveLots(lots);
+      saveSales(salesData);
+      renderAll();
+      console.log('%c[FLIPR cleanup] restored lots + sales from the backup taken ' + new Date(snap.at || Date.now()).toLocaleString(), 'color:#4c9;font-weight:bold');
+      return;
+    }
+
+    const buyLots = lots.filter((l) => typeof l.source === 'string' && l.source.indexOf('trade:') === 0);
+    const sellRows = (salesData.recent || []).filter((r) => r.market === 'trade');
+    let dProfit = 0, matchedSells = 0;
+    for (const r of sellRows) { dProfit += Number(r.profit) || 0; if ((Number(r.matchedQty) || 0) > 0) matchedSells += 1; }
+
+    console.log('%c[FLIPR cleanup] trades auto-logged from viewing — ' + (opts.apply ? 'APPLYING' : 'dry run'), C);
+    if (buyLots.length) console.table(buyLots.map((l) => ({ item: l.itemName, qty: l.qty, unitCost: Math.round(l.unitCost), from: l.seller || '', when: new Date(l.ts).toLocaleString() })));
+    if (sellRows.length) console.table(sellRows.map((r) => ({ item: r.itemName, qty: r.qty, proceeds: r.proceeds, profit: Math.round(r.profit), matchedQty: r.matchedQty, when: new Date(r.ts).toLocaleString() })));
+    console.log('Summary:', { buyLotsToRemove: buyLots.length, sellRowsToRemove: sellRows.length, realizedProfitChange: -Math.round(dProfit), sellsThatConsumedRealLots: matchedSells });
+    if (matchedSells > 0) console.log('%cNote: ' + matchedSells + ' trade sell(s) had matched a real holding as cost basis; their totals are reversed, but the consumed holding is not re-added (rare, and only for items you actually held).', 'color:#e6a800');
+
+    if (buyLots.length === 0 && sellRows.length === 0) { console.log('%cNothing to clean — no view-logged trades found.', 'color:#4c9'); return; }
+    if (!opts.apply) { console.log('%cNothing changed. Run  fliprCleanupOldTrades({ apply: true })  to remove these (a backup is saved first; fliprCleanupOldTrades({ restore: true }) undoes it).', 'color:#4c9'); return; }
+
+    try {
+      Store.set(TRADE_CLEANUP_BACKUP_KEY, JSON.stringify({ lots, sales: salesData, at: Date.now() }));
+    } catch (e) {
+      console.log('%c[FLIPR cleanup] backup failed — aborting, nothing removed', 'color:#e66', e);
+      return;
+    }
+
+    const removeIds = new Set(buyLots.map((l) => l.id));
+    lots = lots.filter((l) => !removeIds.has(l.id));
+    saveLots(lots);
+
+    const t = salesData.totals;
+    for (const r of sellRows) {
+      const qty = Number(r.qty) || 0;
+      const unit = qty > 0 ? (Number(r.proceeds) || 0) / qty : 0;
+      const mQty = Number(r.matchedQty) || 0;
+      const uQty = qty - mQty;
+      t.realizedProfit -= Number(r.profit) || 0;
+      t.matchedProceeds -= unit * mQty;
+      t.matchedCost -= Number(r.matchedCost) || 0;
+      t.matchedQty -= mQty;
+      t.untrackedProceeds -= unit * uQty;
+      t.untrackedQty -= uQty;
+      t.feePaid -= Number(r.fee) || 0;
+      t.salesCount = Math.max(0, (Number(t.salesCount) || 0) - 1);
+    }
+    const sellIds = new Set(sellRows.map((r) => r.id));
+    salesData.recent = (salesData.recent || []).filter((r) => !sellIds.has(r.id));
+    saveSales(salesData);
+
+    renderAll();
+    console.log('%c[FLIPR cleanup] done — removed ' + buyLots.length + ' buy lot(s) and ' + sellRows.length + ' sell(s). Backup saved; fliprCleanupOldTrades({ restore: true }) to undo.', 'color:#4c9;font-weight:bold');
+  }
+  try {
+    const cleanupHost = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    cleanupHost.fliprCleanupOldTrades = cleanupOldTrades;
+  } catch (e) { /* page exposure is best-effort */ }
+
   // Confirmed sell log-entry types (numeric details.id, read off the live log):
   // 1113 Item market sell, 1104 its legacy variant, 1226 Bazaar sell, 1221 its
   // legacy variant, 5011 Points market sell, 4210 Item shop sell (city shops).
