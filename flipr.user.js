@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FLIPR: Flip Profit Tracker
 // @namespace    http://torn.city.com.dot.com.com
-// @version      2.48.0
+// @version      2.48.1
 // @description  Automatically logs what you paid for bazaar/item market purchases (via your own Torn API key) and warns you before you list them for less than a real profit, accounting for Torn's item market sales tax
 // @updateURL    https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
 // @downloadURL  https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
@@ -61,7 +61,7 @@
   ////////////////////////////////////////////////////////////////////////////
 
   const DEBUG = false;
-  const SCRIPT_VERSION = '2.48.0';
+  const SCRIPT_VERSION = '2.48.1';
 
   const STORAGE_KEY = 'flipr_lots_v1';
   const SETTINGS_KEY = 'flipr_settings_v1';
@@ -4534,6 +4534,30 @@ yasukuni sword|65|70|49|54
     return Number.isFinite(t) ? t : Math.floor(Date.now() / 1000);
   }
 
+  // How long ago (seconds) the "trade was accepted" line is, versus now. A completed-
+  // trade log page looks identical whether the trade just happened or you opened it
+  // from Past Trades months later, so this is what tells auto-logging the two apart.
+  // Torn may print trade times in TCT (UTC) or in your local timezone depending on
+  // your account's time setting, so measure the age under BOTH readings and take the
+  // smaller: a just-completed trade is ~0s old under whichever Torn is actually using,
+  // while a genuinely old trade is far past the window under both. Unreadable
+  // timestamp -> 0 (treat as fresh; never drop a real trade over an unparsed time).
+  function tradeAgeSeconds(text) {
+    const m = text.match(/(\d{2}):(\d{2}):(\d{2})\s*-\s*(\d{2})\/(\d{2})\/(\d{2})[\s\S]{0,60}?the trade was accepted by/i);
+    if (!m) return 0;
+    const HH = +m[1], MM = +m[2], SS = +m[3], dd = +m[4], mo = +m[5], y = 2000 + +m[6];
+    const asLocal = new Date(y, mo - 1, dd, HH, MM, SS).getTime();
+    const asUtc = Date.UTC(y, mo - 1, dd, HH, MM, SS);
+    const now = Date.now();
+    const ageL = Number.isFinite(asLocal) ? Math.abs(now - asLocal) : Infinity;
+    const ageU = Number.isFinite(asUtc) ? Math.abs(now - asUtc) : Infinity;
+    const age = Math.min(ageL, ageU);
+    return Number.isFinite(age) ? age / 1000 : 0;
+  }
+  // Only a freshly completed trade should auto-log; older than this (under both
+  // timezone readings) means you're browsing history, so record nothing.
+  const TRADE_FRESH_WINDOW_SEC = 3600; // 1 hour
+
   // ---- Trade-reader diagnostics -------------------------------------------------
   // A completed trade that never records is otherwise a black box: the reader just
   // returns at whichever gate failed and leaves nothing behind. This keeps a tiny
@@ -4617,6 +4641,16 @@ yasukuni sword|65|70|49|54
     if (!mine) { recordTradeAttempt(tradeId, 'self-name-unmatched', { selfName: self.name, sideNames: [sides[0].name, sides[1].name] }); return; } // neither header matched my name; don't guess, don't mark done
 
     const tsSeconds = acceptedTsSeconds(pageText);
+
+    // Don't log trades you're only viewing. A trade accepted more than an hour ago
+    // (under either timezone reading) is Past-Trades browsing, not a live result, so
+    // skip it - and leave the processed ledger untouched so re-viewing stays harmless.
+    const tradeAge = tradeAgeSeconds(pageText);
+    if (tradeAge > TRADE_FRESH_WINDOW_SEC) {
+      recordTradeAttempt(tradeId, 'skipped-old-trade', { ageMin: Math.round(tradeAge / 60) });
+      Diag.bump('tradeGate:skippedOld');
+      return;
+    }
 
     // BUY: I paid money for exactly one item type, and gave no items of my own.
     if (mine.money > 0 && mine.items.length === 0 && theirs.money === 0 && theirs.items.length === 1) {
