@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FLIPR: Flip Profit Tracker
 // @namespace    http://torn.city.com.dot.com.com
-// @version      2.48.2
+// @version      2.48.3
 // @description  Automatically logs what you paid for bazaar/item market purchases (via your own Torn API key) and warns you before you list them for less than a real profit, accounting for Torn's item market sales tax
 // @updateURL    https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
 // @downloadURL  https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
@@ -61,7 +61,7 @@
   ////////////////////////////////////////////////////////////////////////////
 
   const DEBUG = false;
-  const SCRIPT_VERSION = '2.48.2';
+  const SCRIPT_VERSION = '2.48.3';
 
   const STORAGE_KEY = 'flipr_lots_v1';
   const SETTINGS_KEY = 'flipr_settings_v1';
@@ -3332,27 +3332,60 @@
       return;
     }
 
+    // Hand-entered cost bases roll into the headline the SAME way they already roll
+    // into each row (the adjProfit below): the frozen lifetime totals stay untouched
+    // (see recordSale - that invariant is deliberate), but the DISPLAYED realized
+    // profit, and the known/no-cost split further down, treat each no-basis sale that
+    // now carries a manual basis as a known-cost sale: its (proceeds - basis) is added
+    // to profit and its proceeds/qty move out of the untracked bucket. manualQty <=
+    // t.untrackedQty always: a sale eligible for a manual basis has matchedQty 0, so
+    // its whole qty landed in untracked at record time, and dropping it from `recent`
+    // (cleanup) also reverses that total.
+    let manualProfit = 0, manualProceeds = 0, manualQty = 0;
+    for (const r of (salesData.recent || [])) {
+      if (r.matchedQty > 0) continue;
+      const c = Number(r.manualCost);
+      if (!Number.isFinite(c)) continue;
+      const p = Number(r.proceeds) || 0;
+      manualProfit += p - c;
+      manualProceeds += p;
+      manualQty += Number(r.qty) || 0;
+    }
+    const shownRealized = t.realizedProfit + manualProfit;
+
     // Headline realized profit - the one number the feature exists for.
     const profitRow = document.createElement('div');
     profitRow.className = 'flipr-holding';
     const profitName = document.createElement('span');
     profitName.className = 'flipr-holding-name';
     profitName.textContent = 'Realized profit';
+    if (manualProfit !== 0) {
+      profitName.title =
+        `Includes ${money(manualProfit)} from no-basis sales you gave a cost basis.\n`
+        + `Flip-matched profit alone is ${money(t.realizedProfit)}.`;
+    }
     const profitVal = document.createElement('span');
     profitVal.className = 'flipr-holding-meta';
-    profitVal.style.color = t.realizedProfit >= 0 ? '#6c6' : '#e66';
-    profitVal.textContent = `${t.realizedProfit >= 0 ? '+' : ''}${money(t.realizedProfit)}`;
+    profitVal.style.color = shownRealized >= 0 ? '#6c6' : '#e66';
+    profitVal.textContent = `${shownRealized >= 0 ? '+' : ''}${money(shownRealized)}`;
     profitRow.appendChild(profitName);
     profitRow.appendChild(profitVal);
     summaryEl.appendChild(profitRow);
 
     // Supporting context lines. `since` uses firstTs so it reads as a real window.
+    // A hand-entered basis counts as a known cost here too, so the same sales that
+    // joined the headline above move from the no-cost bucket into the known-cost one
+    // (both figures derived for display; the frozen totals keep their raw split).
     const since = t.firstTs ? new Date(t.firstTs).toLocaleDateString() : '';
+    const knownProceeds = t.matchedProceeds + manualProceeds;
+    const knownQty = t.matchedQty + manualQty;
+    const noCostProceeds = t.untrackedProceeds - manualProceeds;
+    const noCostQty = t.untrackedQty - manualQty;
     const lines = [
-      `${money(t.matchedProceeds)} sold with known cost across ${t.matchedQty.toLocaleString('en-US')} item(s)`,
+      `${money(knownProceeds)} sold with known cost across ${knownQty.toLocaleString('en-US')} item(s)`,
     ];
-    if (t.untrackedQty > 0) {
-      lines.push(`${money(t.untrackedProceeds)} from ${t.untrackedQty.toLocaleString('en-US')} item(s) with no recorded cost`);
+    if (noCostQty > 0) {
+      lines.push(`${money(noCostProceeds)} from ${noCostQty.toLocaleString('en-US')} item(s) with no recorded cost`);
     }
     if (t.feePaid > 0) {
       lines.push(`${money(t.feePaid)} paid in Item Market tax (bazaar selling avoids this)`);
