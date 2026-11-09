@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FLIPR: Flip Profit Tracker
 // @namespace    http://torn.city.com.dot.com.com
-// @version      2.48.1
+// @version      2.48.2
 // @description  Automatically logs what you paid for bazaar/item market purchases (via your own Torn API key) and warns you before you list them for less than a real profit, accounting for Torn's item market sales tax
 // @updateURL    https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
 // @downloadURL  https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
@@ -61,7 +61,7 @@
   ////////////////////////////////////////////////////////////////////////////
 
   const DEBUG = false;
-  const SCRIPT_VERSION = '2.48.1';
+  const SCRIPT_VERSION = '2.48.2';
 
   const STORAGE_KEY = 'flipr_lots_v1';
   const SETTINGS_KEY = 'flipr_settings_v1';
@@ -4561,18 +4561,45 @@ yasukuni sword|65|70|49|54
         if (t) name = t;
       }
     }
-    if (id || name) selfIdentity = { id, name };
+    // Torn usernames are strictly [A-Za-z0-9_-]. The TornTools sidebar wraps a stray
+    // separator around the Name value, so the fallback above was resolving "The_Baron:"
+    // (trailing colon) - which no longer equals the clean "The_Baron" read from the
+    // trade column, so the self-vs-side match failed and every live trade logged nothing
+    // despite parsing correctly. Strip any non-username chars off both ends to fix it.
+    if (name) name = name.replace(/^[^A-Za-z0-9_-]+|[^A-Za-z0-9_-]+$/g, '');
+    if (id || name) selfIdentity = { id, name: name || null };
     return selfIdentity;
   }
 
-  // Parse one .user column into { name, money, items:[{name,qty}], resolved }.
-  function parseTradeSide(userEl) {
+  // Parse one .user column into { name, money, items:[{name,qty}] }. `knownNames`
+  // (the two traders, read from the "Trade between A & B" heading) lets us identify
+  // whose column this is even though current Torn appends a "Hide item values" toggle
+  // to the name header - matching the column's text against the real names is robust
+  // to that, where the old "<Name>'s items traded" strip was not and silently left the
+  // self-name match failing (every live trade logged nothing - the bug the probe found).
+  function parseTradeSide(userEl, knownNames) {
     const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
-    const header = userEl.querySelector('.title-black') || userEl.firstElementChild;
-    let name = header ? clean(header.textContent) : '';
-    name = name.replace(/'s items traded\s*$/i, '').trim();
+    const stripName = (s) => clean(s)
+      .replace(/'s items traded\s*$/i, '')            // legacy header format
+      .replace(/\s*(?:hide|show) item values\s*$/i, '') // current value-toggle control
+      .trim();
 
-    let money = 0, hasMoney = false, sawItemsLine = false;
+    // Name: prefer the element whose stripped text IS one of the known traders; fall
+    // back to the old header-element approach for the legacy / unknown-heading DOM.
+    let name = '';
+    if (knownNames && knownNames.length) {
+      const nodes = userEl.querySelectorAll('.title-black, h2, h3, h4, h5, a, b, strong, span, div');
+      for (const el of nodes) {
+        const t = stripName(el.textContent);
+        if (t && knownNames.some((n) => normalize(n) === normalize(t))) { name = t; break; }
+      }
+    }
+    if (!name) {
+      const header = userEl.querySelector('.title-black') || userEl.firstElementChild;
+      name = header ? stripName(header.textContent) : '';
+    }
+
+    let money = 0, hasMoney = false;
     const items = [];
     const seen = new Set();
     const rows = Array.from(userEl.querySelectorAll('.cont .name'));
@@ -4584,25 +4611,31 @@ yasukuni sword|65|70|49|54
       if (/no money in trade/i.test(t)) { hasMoney = true; continue; }
       const mm = t.match(/\$([\d,]+)\s*in trade/i);
       if (mm) { money = Number(mm[1].replace(/,/g, '')); hasMoney = true; continue; }
-      if (/no items in trade/i.test(t) || /no properties in trade/i.test(t)) { sawItemsLine = true; continue; }
-      if (/in trade$/i.test(t)) continue; // any other "... in trade" summary line
-      // Item row: "Name x10" or "10x Name"; bare name is a single non-stackable copy.
-      let im = t.match(/^(.+?)\s*x\s*([\d,]+)$/i);
-      if (im) { items.push({ name: im[1].trim(), qty: Number(im[2].replace(/,/g, '')) || 1 }); sawItemsLine = true; continue; }
-      im = t.match(/^([\d,]+)\s*x\s+(.+)$/i);
-      if (im) { items.push({ name: im[2].trim(), qty: Number(im[1].replace(/,/g, '')) || 1 }); sawItemsLine = true; continue; }
-      items.push({ name: t, qty: 1 }); sawItemsLine = true;
+      if (/no items in trade/i.test(t) || /no properties in trade/i.test(t)) { continue; }
+      if (/^total value\b/i.test(t)) continue;           // Torn's per-side value subtotal (shown when item values are visible)
+      if (/(?:hide|show) item values/i.test(t)) continue; // the value-toggle control text
+      if (/^\$[\d,]+(?:\.\d+)?$/.test(t)) continue;       // a bare item-value element, not an item name
+      if (/in trade$/i.test(t)) continue;                 // any other "... in trade" summary line
+      // Item row: drop a trailing per-item value ("Headphones x1 $216" -> "Headphones
+      // x1"), then read "Name x10" / "10x Name"; a bare name is one non-stackable copy.
+      const core = t.replace(/\s*\$[\d,]+(?:\.\d+)?$/, '').trim();
+      if (!core) continue;
+      let im = core.match(/^(.+?)\s*x\s*([\d,]+)$/i);
+      if (im) { items.push({ name: im[1].trim(), qty: Number(im[2].replace(/,/g, '')) || 1 }); continue; }
+      im = core.match(/^([\d,]+)\s*x\s+(.+)$/i);
+      if (im) { items.push({ name: im[2].trim(), qty: Number(im[1].replace(/,/g, '')) || 1 }); continue; }
+      items.push({ name: core, qty: 1 });
     }
     // Fallback if the money label wasn't inside a .name element for some layout.
     if (!hasMoney) {
       const mm = clean(userEl.textContent).match(/\$([\d,]+)\s*in trade/i);
       if (mm) { money = Number(mm[1].replace(/,/g, '')); hasMoney = true; }
     }
-    // `resolved` = this column has finished rendering both its money and its items
-    // summary lines. A half-rendered React column (accepted line already on screen,
-    // rows not yet in) would otherwise parse as an empty side and get mis-classified
-    // as an un-priceable trade, burning the ID on the processed ledger for good.
-    return { name, money, items, resolved: hasMoney && sawItemsLine };
+    // `resolved` = this column has rendered. Torn always draws a money / "no money in
+    // trade" line per side, so that line is the render marker. (The old check also
+    // required an items line, but a money-only side no longer prints "No items in
+    // trade", which left such trades permanently "unresolved" and never logged.)
+    return { name, money, items, resolved: hasMoney };
   }
 
   // Parse "14:54:57 - 03/07/26" (DD/MM/YY) near the accepted line into unix seconds.
@@ -4714,7 +4747,13 @@ yasukuni sword|65|70|49|54
     const self = getSelfIdentity();
     if (!self || !self.name) { recordTradeAttempt(tradeId, 'no-self-identity', { selfIdFound: !!(self && self.id) }); return; } // can't tell which side is me - retry on a later load
     const norm = (s) => normalize(String(s || ''));
-    const sides = [parseTradeSide(left), parseTradeSide(right)];
+    // The two traders, from the authoritative "Trade between A & B" heading - used to
+    // identify each column's owner despite the per-side "Hide item values" toggle that
+    // current Torn concatenates onto the name header. Torn usernames carry no spaces,
+    // so a single \S+ token per name is safe. No heading -> fall back to self only.
+    const heading = (cont.textContent || '').match(/Trade between\s+(\S+)\s+&\s+(\S+)/i);
+    const knownNames = heading ? [heading[1], heading[2]] : [self.name];
+    const sides = [parseTradeSide(left, knownNames), parseTradeSide(right, knownNames)];
     if (!sides[0].resolved || !sides[1].resolved) { recordTradeAttempt(tradeId, 'sides-unresolved', { leftResolved: sides[0].resolved, rightResolved: sides[1].resolved }); return; } // columns still rendering - retry, don't mark done
     let mine = null, theirs = null;
     if (norm(sides[0].name) === norm(self.name)) { mine = sides[0]; theirs = sides[1]; }
