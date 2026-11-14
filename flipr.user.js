@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FLIPR: Flip Profit Tracker
 // @namespace    http://torn.city.com.dot.com.com
-// @version      2.48.3
+// @version      2.49.0
 // @description  Automatically logs what you paid for bazaar/item market purchases (via your own Torn API key) and warns you before you list them for less than a real profit, accounting for Torn's item market sales tax
 // @updateURL    https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
 // @downloadURL  https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
@@ -61,7 +61,7 @@
   ////////////////////////////////////////////////////////////////////////////
 
   const DEBUG = false;
-  const SCRIPT_VERSION = '2.48.3';
+  const SCRIPT_VERSION = '2.49.0';
 
   const STORAGE_KEY = 'flipr_lots_v1';
   const SETTINGS_KEY = 'flipr_settings_v1';
@@ -1972,6 +1972,129 @@
     #flipr-tax-popover .flipr-tax-close { position: absolute; top: 3px; right: 7px; color: #888;
       cursor: pointer; font-size: 14px; line-height: 1; }
     #flipr-tax-popover .flipr-tax-close:hover { color: #ccc; }
+
+    /* ================= THEME: Torn Native (private palette) ================= */
+    :root { --flipr-pos: #8fc63f; --flipr-neg: #e5534b; --flipr-link: #74c0fc; }
+    #flipr-panel { background: #2e2e2e; color: #ccc; border: 1px solid #161616; border-radius: 5px;
+      font-family: Arial, Helvetica, sans-serif; font-variant-numeric: tabular-nums;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.04), 0 6px 22px rgba(0,0,0,0.65); }
+    #flipr-panel.flipr-collapsed { box-shadow: 0 0 0 2px rgba(58,128,214,0.45), 0 4px 14px rgba(0,0,0,0.6); }
+    #flipr-header { background: linear-gradient(180deg, #5c5c5c 0%, #3d3d3d 55%, #333 100%);
+      border-bottom: 1px solid #161616; border-radius: 5px 5px 0 0; padding: 7px 10px;
+      color: #a8a8a8; font-size: 11px; text-shadow: 0 1px 0 rgba(0,0,0,0.65); }
+    #flipr-header b { color: #4da3ff; font-size: 13px; letter-spacing: 0.05em; margin-right: 2px; }
+    .flipr-header-mini { color: #4da3ff; text-shadow: 0 1px 0 #000; }
+    #flipr-toggle { color: #ddd; }
+    #flipr-status-line { color: #6fa8dc; }
+    .flipr-tabs { gap: 3px; margin-bottom: 12px; padding: 3px; background: #232323;
+      border: 1px solid #191919; border-radius: 5px; }
+    .flipr-tab-btn { background: linear-gradient(180deg, #4b4b4b 0%, #3a3a3a 50%, #2f2f2f 100%);
+      color: #bdbdbd; border: 1px solid #171717; border-radius: 4px; font-weight: bold;
+      text-shadow: 0 1px 0 rgba(0,0,0,0.65); transition: background 0.15s, color 0.15s, box-shadow 0.15s; }
+    .flipr-tab-btn:hover { background: linear-gradient(180deg, #595959 0%, #444 50%, #383838 100%); color: #fff; }
+    .flipr-tab-btn.flipr-tab-active { background: linear-gradient(180deg, #4d8fdc 0%, #2f6fbf 45%, #24599b 100%);
+      color: #fff; border-color: #1d477e; box-shadow: 0 0 8px rgba(58,128,214,0.35); }
+    .flipr-section { margin-bottom: 10px; padding: 0 8px 8px; background: #292929;
+      border: 1px solid #1b1b1b; border-radius: 5px; overflow: hidden; }
+    .flipr-section:first-child { border-top: 1px solid #1b1b1b; padding-top: 0; }
+    .flipr-section > :first-child:not(h4) { margin-top: 8px; }
+    #flipr-panel .flipr-section h4 { display: flex; align-items: center; margin: 0 -8px 8px; padding: 5px 9px;
+      background: linear-gradient(180deg, #505050 0%, #373737 100%); border-bottom: 1px solid #191919;
+      color: #f0f0f0; font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase;
+      text-shadow: 0 1px 0 rgba(0,0,0,0.75); }
+    .flipr-row label, .flipr-checkbox-row, .flipr-fee-toggle { color: #c2c2c2; }
+    .flipr-row input, .flipr-row select, .flipr-debug-textarea { background: #1f1f1f; color: #e0e0e0;
+      border: 1px solid #484848; border-radius: 4px; box-shadow: inset 0 1px 2px rgba(0,0,0,0.5);
+      transition: border-color 0.15s, box-shadow 0.15s; }
+    .flipr-row input:focus, .flipr-row select:focus, .flipr-debug-textarea:focus { outline: none; border-color: #3a80d6;
+      box-shadow: inset 0 1px 2px rgba(0,0,0,0.5), 0 0 0 2px rgba(58,128,214,0.25); }
+    .flipr-row select option { background: #232323; color: #ddd; }
+    #flipr-panel input[type="checkbox"], #flipr-panel input[type="radio"] { accent-color: #3a80d6; }
+    .flipr-price-edit { background: #161616; border-color: #3a80d6; }
+    .flipr-holding { padding: 5px 5px; margin: 0 -5px; border-bottom: 1px solid #353535; border-radius: 3px;
+      transition: background 0.12s; }
+    .flipr-holding:hover { background: #333; }
+    .flipr-holding-name { color: #e4e4e4; }
+    .flipr-holding-meta { color: #9b9b9b; }
+    .flipr-holding-meta:hover { color: #4da3ff; }
+    .flipr-hint { color: #868686; }
+    .flipr-empty { color: #7a7a7a; }
+    .flipr-btn { background: linear-gradient(180deg, #5b5b5b 0%, #454545 40%, #333 100%); color: #eee;
+      border: 1px solid #111; border-radius: 4px; font-weight: bold; text-shadow: 0 1px 0 rgba(0,0,0,0.7);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.09); }
+    .flipr-btn:hover { background: linear-gradient(180deg, #6b6b6b 0%, #4f4f4f 40%, #3c3c3c 100%); color: #fff; }
+    .flipr-btn:active { background: linear-gradient(180deg, #2c2c2c, #3c3c3c); }
+    .flipr-btn.flipr-btn-danger { background: linear-gradient(180deg, #a63c33 0%, #7e2b25 50%, #5f1f1b 100%); border-color: #3a1210; }
+    .flipr-btn.flipr-btn-danger:hover { background: linear-gradient(180deg, #bb483e 0%, #8e322b 50%, #6b2420 100%); }
+    .flipr-result { background: #232323; border: 1px solid #1a1a1a; border-radius: 4px; }
+    .flipr-result.flipr-profit { border-left: 3px solid var(--flipr-pos); background: linear-gradient(90deg, rgba(143,198,63,0.13), #232323 65%); }
+    .flipr-result.flipr-loss { border-left: 3px solid var(--flipr-neg); background: linear-gradient(90deg, rgba(229,83,75,0.13), #232323 65%); }
+    .flipr-result.flipr-profit .flipr-verdict { color: var(--flipr-pos); }
+    .flipr-result.flipr-loss .flipr-verdict { color: var(--flipr-neg); }
+    .flipr-q { background: #565656; color: #eee; box-shadow: inset 0 1px 0 rgba(255,255,255,0.14); }
+    .flipr-q:hover { background: #3a80d6; }
+    .flipr-q.flipr-q-on { background: #4da3ff; color: #1a1a1a; }
+    .flipr-toast, #flipr-tax-popover { background: #2e2e2e; color: #ddd; border: 1px solid #161616;
+      border-left: 3px solid #3a80d6; border-radius: 5px; box-shadow: 0 6px 22px rgba(0,0,0,0.65); }
+    #flipr-tax-popover .flipr-tax-net b { color: var(--flipr-pos); }
+    #flipr-help { background: #2e2e2e; color: #ccc; border: 1px solid #161616; border-radius: 5px; }
+    #flipr-help h4 { margin: 0 -12px 8px; padding: 7px 12px; color: #f0f0f0; border-bottom: 1px solid #191919;
+      background: linear-gradient(180deg, #505050 0%, #373737 100%); text-shadow: 0 1px 0 rgba(0,0,0,0.75); }
+    #flipr-dock-btn { background: linear-gradient(180deg, #4d8fdc 0%, #2f6fbf 50%, #24599b 100%);
+      border-color: #1d477e; color: #fff; text-shadow: 0 1px 0 rgba(0,0,0,0.5); }
+    #flipr-dock-btn:hover { background: linear-gradient(180deg, #5b9ee6 0%, #3a80d6 50%, #2b66ad 100%); }
+    #flipr-resize { background: linear-gradient(135deg, transparent 0 45%, #3a80d6 45% 55%, transparent 55% 68%, #3a80d6 68% 78%, transparent 78%); }
+    .flipr-body, #flipr-holdings, #flipr-help { scrollbar-width: thin; scrollbar-color: #4c4c4c transparent; }
+    .flipr-body::-webkit-scrollbar, #flipr-holdings::-webkit-scrollbar, #flipr-help::-webkit-scrollbar { width: 8px; }
+    .flipr-body::-webkit-scrollbar-thumb, #flipr-holdings::-webkit-scrollbar-thumb, #flipr-help::-webkit-scrollbar-thumb {
+      background: #4c4c4c; border-radius: 4px; border: 2px solid #2e2e2e; }
+    /* ---- palette: FLIPR private (teal) ---- */
+    :root { --flipr-pos: #6c6; --flipr-neg: #e5534b; --flipr-link: #7cc; }
+    #flipr-panel { background: #1c1c1c; color: #eee; border-color: #3a3a3a;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.03), 0 6px 20px rgba(0,0,0,0.6); }
+    #flipr-panel.flipr-collapsed { box-shadow: 0 0 0 2px rgba(119,204,204,0.45), 0 4px 14px rgba(0,0,0,0.6); }
+    #flipr-header { background: linear-gradient(180deg, #3e3e3e 0%, #2c2c2c 55%, #262626 100%); border-bottom-color: #111; }
+    #flipr-header b, .flipr-header-mini { color: #7cc; }
+    #flipr-status-line { color: #8cc; }
+    .flipr-tabs { background: #141414; border-color: #2a2a2a; }
+    .flipr-tab-btn { background: linear-gradient(180deg, #363636 0%, #2c2c2c 50%, #262626 100%); color: #999; border-color: #111; }
+    .flipr-tab-btn:hover { background: linear-gradient(180deg, #424242 0%, #353535 50%, #2e2e2e 100%); color: #eee; }
+    .flipr-tab-btn.flipr-tab-active { background: linear-gradient(180deg, #474747 0%, #3a3a3a 50%, #303030 100%);
+      color: #7cc; border-color: #7cc; box-shadow: 0 0 8px rgba(119,204,204,0.25); }
+    .flipr-section { background: #222; border-color: #2a2a2a; }
+    .flipr-section:first-child { border-top-color: #2a2a2a; }
+    #flipr-panel .flipr-section h4 { background: linear-gradient(180deg, #363636 0%, #2a2a2a 100%); border-bottom-color: #161616; color: #7cc; }
+    .flipr-row label, .flipr-checkbox-row, .flipr-fee-toggle { color: #bbb; }
+    .flipr-row input, .flipr-row select, .flipr-debug-textarea { background: #111; color: #eee; border-color: #555; }
+    .flipr-row input:focus, .flipr-row select:focus, .flipr-debug-textarea:focus { border-color: #7cc;
+      box-shadow: inset 0 1px 2px rgba(0,0,0,0.5), 0 0 0 2px rgba(119,204,204,0.22); }
+    .flipr-row select option { background: #1c1c1c; color: #eee; }
+    #flipr-panel input[type="checkbox"], #flipr-panel input[type="radio"] { accent-color: #7cc; }
+    .flipr-price-edit { background: #111; border-color: #7cc; }
+    .flipr-holding { border-bottom-color: #2a2a2a; }
+    .flipr-holding:hover { background: #262626; }
+    .flipr-holding-name { color: #eee; }
+    .flipr-holding-meta { color: #999; }
+    .flipr-holding-meta:hover { color: #cfc; }
+    .flipr-hint { color: #8a8a8a; }
+    .flipr-empty { color: #8a8a8a; }
+    .flipr-btn { background: linear-gradient(180deg, #4a4a4a 0%, #3a3a3a 45%, #2e2e2e 100%); }
+    .flipr-btn:hover { background: linear-gradient(180deg, #575757 0%, #4a4a4a 45%, #3a3a3a 100%); }
+    .flipr-btn.flipr-btn-danger { background: linear-gradient(180deg, #6e3838 0%, #5a2d2d 55%, #4a2424 100%); border-color: #2a1414; }
+    .flipr-btn.flipr-btn-danger:hover { background: linear-gradient(180deg, #824343 0%, #6e3838 55%, #5a2d2d 100%); }
+    .flipr-result { background: #111; border-color: #2a2a2a; }
+    .flipr-result.flipr-profit { background: linear-gradient(90deg, rgba(102,204,102,0.12), #111 65%); }
+    .flipr-result.flipr-loss { background: linear-gradient(90deg, rgba(229,83,75,0.12), #111 65%); }
+    .flipr-q { background: #3a3a3a; }
+    .flipr-q:hover { background: #4f9e9e; }
+    .flipr-q.flipr-q-on { background: #7cc; color: #111; }
+    .flipr-toast, #flipr-tax-popover { background: #1c1c1c; color: #eee; border-color: #3a3a3a; border-left-color: #7cc; }
+    #flipr-help { background: #1c1c1c; color: #eee; border-color: #3a3a3a; }
+    #flipr-help h4 { background: linear-gradient(180deg, #363636 0%, #2a2a2a 100%); color: #7cc; border-bottom-color: #161616; }
+    #flipr-resize { background: linear-gradient(135deg, transparent 0 45%, #7cc 45% 55%, transparent 55% 68%, #7cc 68% 78%, transparent 78%); }
+    .flipr-body, #flipr-holdings, #flipr-help { scrollbar-color: #3a3a3a transparent; }
+    .flipr-body::-webkit-scrollbar-thumb, #flipr-holdings::-webkit-scrollbar-thumb, #flipr-help::-webkit-scrollbar-thumb {
+      background: #3a3a3a; border-color: #1c1c1c; }
   `;
   // Guarded for the same reason as the panel append below: at document-end <head> is
   // always parsed in practice, but appending to null would throw and take the whole
@@ -2755,7 +2878,7 @@
       keyLink.target = '_blank';
       keyLink.rel = 'noopener';
       keyLink.textContent = 'Make a FLIPR-only key';
-      keyLink.style.color = '#4da3ff';
+      keyLink.style.color = 'var(--flipr-link, #4da3ff)';
       keyHint.appendChild(keyLink);
       keyHint.appendChild(document.createTextNode(
         ' - opens Torn with just the three boxes FLIPR needs already ticked: '
@@ -3366,7 +3489,7 @@
     }
     const profitVal = document.createElement('span');
     profitVal.className = 'flipr-holding-meta';
-    profitVal.style.color = shownRealized >= 0 ? '#6c6' : '#e66';
+    profitVal.style.color = shownRealized >= 0 ? 'var(--flipr-pos, #6c6)' : 'var(--flipr-neg, #e66)';
     profitVal.textContent = `${shownRealized >= 0 ? '+' : ''}${money(shownRealized)}`;
     profitRow.appendChild(profitName);
     profitRow.appendChild(profitVal);
@@ -3425,12 +3548,12 @@
       }
       if (rec.matchedQty > 0) {
         const sign = rec.profit >= 0 ? '+' : '';
-        metaSpan.style.color = rec.profit >= 0 ? '#6c6' : '#e66';
+        metaSpan.style.color = rec.profit >= 0 ? 'var(--flipr-pos, #6c6)' : 'var(--flipr-neg, #e66)';
         const partial = rec.matchedQty < rec.qty ? ` (${rec.matchedQty}/${rec.qty})` : '';
         metaText = `${sign}${money(rec.profit)}${partial}${formatStats(rec.stats)}`;
       } else if (hasManualCost) {
         const sign = adjProfit >= 0 ? '+' : '';
-        metaSpan.style.color = adjProfit >= 0 ? '#6c6' : '#e66';
+        metaSpan.style.color = adjProfit >= 0 ? 'var(--flipr-pos, #6c6)' : 'var(--flipr-neg, #e66)';
         metaText = `${sign}${money(adjProfit)} ${DOT} basis ${money(manualCost)}${formatStats(rec.stats)}`;
       } else {
         metaText = `${money(rec.proceeds)} \u00B7 no basis`;
