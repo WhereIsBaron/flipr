@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FLIPR: Flip Profit Tracker
 // @namespace    http://torn.city.com.dot.com.com
-// @version      2.49.0
+// @version      2.49.1
 // @description  Automatically logs what you paid for bazaar/item market purchases (via your own Torn API key) and warns you before you list them for less than a real profit, accounting for Torn's item market sales tax
 // @updateURL    https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
 // @downloadURL  https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
@@ -61,7 +61,7 @@
   ////////////////////////////////////////////////////////////////////////////
 
   const DEBUG = false;
-  const SCRIPT_VERSION = '2.49.0';
+  const SCRIPT_VERSION = '2.49.1';
 
   const STORAGE_KEY = 'flipr_lots_v1';
   const SETTINGS_KEY = 'flipr_settings_v1';
@@ -2095,6 +2095,57 @@
     .flipr-body, #flipr-holdings, #flipr-help { scrollbar-color: #3a3a3a transparent; }
     .flipr-body::-webkit-scrollbar-thumb, #flipr-holdings::-webkit-scrollbar-thumb, #flipr-help::-webkit-scrollbar-thumb {
       background: #3a3a3a; border-color: #1c1c1c; }
+
+    /* ---- light mode (Torn light theme only; dark mode unchanged) ---- */
+    body:not(.dark-mode) { --flipr-pos: #3a8a1e; --flipr-neg: #c8352d; --flipr-link: #1f7a7a; }
+    body:not(.dark-mode) #flipr-panel { background: #f2f2f2; color: #333; border-color: #c4c4c4; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.6), 0 6px 20px rgba(0,0,0,0.22); }
+    body:not(.dark-mode) #flipr-panel.flipr-collapsed { box-shadow: 0 0 0 2px rgba(42,138,138,0.45), 0 4px 14px rgba(0,0,0,0.25); }
+    body:not(.dark-mode) #flipr-header { background: linear-gradient(180deg, #fdfdfd 0%, #e6e6e6 55%, #dadada 100%); border-bottom-color: #c4c4c4; color: #666; text-shadow: 0 1px 0 rgba(255,255,255,0.85); }
+    body:not(.dark-mode) #flipr-header b, body:not(.dark-mode) .flipr-header-mini { color: #1f7a7a; text-shadow: 0 1px 0 rgba(255,255,255,0.85); }
+    body:not(.dark-mode) #flipr-toggle { color: #555; }
+    body:not(.dark-mode) #flipr-status-line { color: #2a7f7f; }
+    body:not(.dark-mode) #flipr-status-line.flipr-status-warn { color: #c8352d; }
+    body:not(.dark-mode) .flipr-tabs { background: #e2e2e2; border-color: #cdcdcd; }
+    body:not(.dark-mode) .flipr-tab-btn { background: linear-gradient(180deg, #ffffff 0%, #efefef 50%, #e3e3e3 100%); color: #555; border-color: #c2c2c2; text-shadow: 0 1px 0 #fff; }
+    body:not(.dark-mode) .flipr-tab-btn:hover { background: linear-gradient(180deg, #ffffff 0%, #f6f6f6 50%, #ebebeb 100%); color: #222; }
+    body:not(.dark-mode) .flipr-tab-btn.flipr-tab-active { background: linear-gradient(180deg, #ffffff 0%, #eef7f7 50%, #dcefef 100%); color: #1f7a7a; border-color: #3a9a9a; box-shadow: 0 0 6px rgba(42,138,138,0.25); }
+    body:not(.dark-mode) .flipr-section { background: #fff; border-color: #d2d2d2; }
+    body:not(.dark-mode) .flipr-section:first-child { border-top-color: #d2d2d2; }
+    body:not(.dark-mode) #flipr-panel .flipr-section h4 { background: linear-gradient(180deg, #f8f8f8 0%, #e3e3e3 100%); border-bottom-color: #d0d0d0; color: #1f7a7a; text-shadow: 0 1px 0 #fff; }
+    body:not(.dark-mode) .flipr-row label, body:not(.dark-mode) .flipr-checkbox-row, body:not(.dark-mode) .flipr-fee-toggle { color: #444; }
+    body:not(.dark-mode) .flipr-row input, body:not(.dark-mode) .flipr-row select, body:not(.dark-mode) .flipr-debug-textarea { background: #fff; color: #222; border-color: #bdbdbd; box-shadow: inset 0 1px 2px rgba(0,0,0,0.08); }
+    body:not(.dark-mode) .flipr-row input:focus, body:not(.dark-mode) .flipr-row select:focus, body:not(.dark-mode) .flipr-debug-textarea:focus { border-color: #2a8a8a; box-shadow: inset 0 1px 2px rgba(0,0,0,0.08), 0 0 0 2px rgba(42,138,138,0.2); }
+    body:not(.dark-mode) .flipr-row select option { background: #fff; color: #222; }
+    body:not(.dark-mode) #flipr-panel input[type="checkbox"], body:not(.dark-mode) #flipr-panel input[type="radio"] { accent-color: #2a8a8a; }
+    body:not(.dark-mode) .flipr-price-edit { background: #fff; color: #222; border-color: #2a8a8a; }
+    body:not(.dark-mode) .flipr-holding { border-bottom-color: #e4e4e4; }
+    body:not(.dark-mode) .flipr-holding:hover { background: #f1f7f7; }
+    body:not(.dark-mode) .flipr-holding-name { color: #222; }
+    body:not(.dark-mode) .flipr-holding-meta { color: #777; }
+    body:not(.dark-mode) .flipr-holding-meta:hover { color: #1f7a7a; }
+    body:not(.dark-mode) .flipr-hint { color: #777; }
+    body:not(.dark-mode) .flipr-empty { color: #888; }
+    body:not(.dark-mode) .flipr-btn { background: linear-gradient(180deg, #ffffff 0%, #ededed 45%, #e0e0e0 100%); color: #333; border-color: #b9b9b9; text-shadow: 0 1px 0 #fff; box-shadow: inset 0 1px 0 #fff; }
+    body:not(.dark-mode) .flipr-btn:hover { background: linear-gradient(180deg, #ffffff 0%, #f5f5f5 45%, #e8e8e8 100%); color: #111; }
+    body:not(.dark-mode) .flipr-btn:active { background: linear-gradient(180deg, #dcdcdc, #ececec); }
+    body:not(.dark-mode) .flipr-btn.flipr-btn-danger { background: linear-gradient(180deg, #d9534f 0%, #c43a35 55%, #a92f2a 100%); color: #fff; border-color: #8f1f1b; text-shadow: 0 1px 0 rgba(0,0,0,0.3); box-shadow: none; }
+    body:not(.dark-mode) .flipr-btn.flipr-btn-danger:hover { background: linear-gradient(180deg, #e0605c 0%, #cc433e 55%, #b2332e 100%); color: #fff; }
+    body:not(.dark-mode) .flipr-result { background: #f7f7f7; border-color: #dcdcdc; }
+    body:not(.dark-mode) .flipr-result.flipr-profit { background: linear-gradient(90deg, rgba(58,138,30,0.12), #f7f7f7 65%); }
+    body:not(.dark-mode) .flipr-result.flipr-loss { background: linear-gradient(90deg, rgba(200,53,45,0.12), #f7f7f7 65%); }
+    body:not(.dark-mode) .flipr-result div:last-child { color: #666; }
+    body:not(.dark-mode) .flipr-q { background: #d4d4d4; color: #333; box-shadow: inset 0 1px 0 rgba(255,255,255,0.6); }
+    body:not(.dark-mode) .flipr-q:hover { background: #2a8a8a; color: #fff; }
+    body:not(.dark-mode) .flipr-q.flipr-q-on { background: #2a8a8a; color: #fff; }
+    body:not(.dark-mode) .flipr-toast, body:not(.dark-mode) #flipr-tax-popover { background: #fff; color: #333; border-color: #c4c4c4; border-left-color: #2a8a8a; box-shadow: 0 6px 20px rgba(0,0,0,0.2); }
+    body:not(.dark-mode) .flipr-toast-close, body:not(.dark-mode) #flipr-tax-popover .flipr-tax-close { color: #999; }
+    body:not(.dark-mode) .flipr-toast-close:hover, body:not(.dark-mode) #flipr-tax-popover .flipr-tax-close:hover { color: #333; }
+    body:not(.dark-mode) #flipr-tax-popover .flipr-tax-orig { color: #777; }
+    body:not(.dark-mode) #flipr-help { background: #fff; color: #333; border-color: #c4c4c4; }
+    body:not(.dark-mode) #flipr-help h4 { background: linear-gradient(180deg, #f8f8f8 0%, #e3e3e3 100%); color: #1f7a7a; border-bottom-color: #d0d0d0; text-shadow: 0 1px 0 #fff; }
+    body:not(.dark-mode) #flipr-resize { background: linear-gradient(135deg, transparent 0 45%, #2a8a8a 45% 55%, transparent 55% 68%, #2a8a8a 68% 78%, transparent 78%); }
+    body:not(.dark-mode) .flipr-body, body:not(.dark-mode) #flipr-holdings, body:not(.dark-mode) #flipr-help { scrollbar-color: #c4c4c4 transparent; }
+    body:not(.dark-mode) .flipr-body::-webkit-scrollbar-thumb, body:not(.dark-mode) #flipr-holdings::-webkit-scrollbar-thumb, body:not(.dark-mode) #flipr-help::-webkit-scrollbar-thumb { background: #c4c4c4; border-color: #f2f2f2; }
   `;
   // Guarded for the same reason as the panel append below: at document-end <head> is
   // always parsed in practice, but appending to null would throw and take the whole
@@ -2270,19 +2321,23 @@
   // whole script from scratch, with no memory of what was open a moment
   // ago) reopens on whichever tab was last active instead of always
   // resetting back to Flip.
-  function showFliprTab(activeName) {
+  function showFliprTab(activeName, skipRender) {
     for (const name of FLIPR_TAB_NAMES) {
       $(`#flipr-tab-${name}`).style.display = name === activeName ? '' : 'none';
       $(`#flipr-tab-btn-${name}`).classList.toggle('flipr-tab-active', name === activeName);
     }
     settings.activeTab = activeName;
     saveSettings(settings);
-    renderAll(); // the newly shown tab may be stale - renderAll only draws this one
+    if (!skipRender) renderAll(); // the newly shown tab may be stale - renderAll only draws this one
   }
   for (const name of FLIPR_TAB_NAMES) {
     $(`#flipr-tab-btn-${name}`).addEventListener('click', () => showFliprTab(name));
   }
-  showFliprTab(settings.activeTab); // restore whichever tab was open before the last refresh
+  // Restore whichever tab was open before the last refresh - visibility ONLY. Drawing a
+  // tab this early runs its renderer before state declared further down exists; a throw
+  // here would kill the script before the drag/click handlers below are wired, leaving a
+  // dead button stuck top-right. The init renderAll() after the renderers draws it.
+  showFliprTab(settings.activeTab, true);
 
   ////////////////////////////////////////////////////////////////////////////
   ////  DRAGGABLE POSITIONING
