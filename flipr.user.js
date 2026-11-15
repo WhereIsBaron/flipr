@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FLIPR: Flip Profit Tracker
 // @namespace    http://torn.city.com.dot.com.com
-// @version      2.49.1
+// @version      2.50.0
 // @description  Automatically logs what you paid for bazaar/item market purchases (via your own Torn API key) and warns you before you list them for less than a real profit, accounting for Torn's item market sales tax
 // @updateURL    https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
 // @downloadURL  https://raw.githubusercontent.com/WhereIsBaron/flipr/main/flipr.user.js
@@ -15,6 +15,7 @@
 // @grant        unsafeWindow
 // @grant        GM_xmlhttpRequest
 // @connect      api.torn.com
+// @connect      yata.yt
 // @connect      bustr-jail-bust-assistant.netlify.app
 // @connect      identitytoolkit.googleapis.com
 // @connect      securetoken.googleapis.com
@@ -61,7 +62,7 @@
   ////////////////////////////////////////////////////////////////////////////
 
   const DEBUG = false;
-  const SCRIPT_VERSION = '2.49.1';
+  const SCRIPT_VERSION = '2.50.0';
 
   const STORAGE_KEY = 'flipr_lots_v1';
   const SETTINGS_KEY = 'flipr_settings_v1';
@@ -75,6 +76,11 @@
   // across reloads, overlapping polls, or multiple open tabs.
   const PROCESSED_LOG_IDS_KEY = 'flipr_processed_log_ids_v1';
   const PROCESSED_TRADES_KEY = 'flipr_processed_trades_v1';
+  // Off-market disposals ledger: items bought then traded in for points
+  // or used (never sold on a market), moved out of Holdings so they stop showing as
+  // never-sold. Its own key; NEVER touches the frozen sales totals. Each record
+  // snapshots the exact lots it removed so an undo re-adds them byte-for-byte.
+  const DISPOSALS_KEY = 'flipr_disposals_v1';
   const PENDING_TICKETS_KEY = 'flipr_pending_tickets_v2';
   // Realized-profit ledger (see the SALES TRACKER section). Forward-only from the
   // build that introduced it: a detected sale is matched FIFO against open lots at
@@ -83,6 +89,7 @@
   const SALES_KEY = 'flipr_sales_v1';
   const RECENT_SALES_MAX = 200; // cap on the per-sale detail list; the running totals are uncapped
   const SALES_ROWS_SHOWN = 30; // how many of those rows are actually DRAWN (perf; totals cover all)
+  const DAILY_ROWS_SHOWN = 30; // how many recent days the "Profit by day" list draws
 
   // Durable diagnostics (see the DIAGNOSTICS section). Persisted to its own key and
   // synced, so a "nothing is being recorded" bug shows its failing gate in the
@@ -121,6 +128,10 @@
     // straight from that device's own cloud doc. Pure diagnostics (see DIAG_KEY).
     DIAG_KEY,
   ];
+  // Settings fields that belong to ONE device and are never adopted from
+  // another device's cloud copy (see cloudApplySnapshot). manualScan is the one that
+  // mattered: the PDA default (on) leaking to desktop switched desktop's API poll off.
+  const CLOUD_DEVICE_LOCAL_SETTINGS = ['manualScan', 'collapsed', 'panelPos', 'collapsedPos', 'panelSize', 'launcherMode', 'dockIndex', 'activeTab'];
 
   // Torn's Custom Key Builder, pre-filled for FLIPR. The three selections below are
   // genuinely all this script calls:
@@ -364,6 +375,8 @@
         // Record completed player trades (trade.php) as buys/sales (see the PLAYER
         // TRADE LOG section). On by default.
         trackTrades: typeof parsed.trackTrades === 'boolean' ? parsed.trackTrades : true,
+        // Trade-flow probe (read-only diagnostic; see TRADE PROBE). Off by default.
+        tradeProbe: typeof parsed.tradeProbe === 'boolean' ? parsed.tradeProbe : false,
         // Manual-scan mode. When ON, FLIPR does NOT run the repeating API log
         // poll and does NOT poll on page load - the capture path is the instant
         // on-page detection (if that box is on, it catches a buy the moment it
@@ -392,7 +405,7 @@
         // no memory of what was open before), so which panel tab was last
         // active has to be persisted here the same way collapsed/feeMode
         // already are, or a refresh would always reset back to Flip.
-        activeTab: ['main', 'profits', 'points', 'settings'].includes(parsed.activeTab) ? parsed.activeTab : 'main',
+        activeTab: ['main', 'profits', 'points', 'sets', 'settings'].includes(parsed.activeTab) ? parsed.activeTab : 'main',
         // Where the panel was last dragged to (see DRAGGABLE POSITIONING). The
         // expanded window and the collapsed button deliberately remember SEPARATE
         // spots - see applyPanelPosition for why sharing one broke. null means
@@ -402,9 +415,13 @@
         // How wide the panel and how tall its scrolling body were last set to by
         // dragging the resize grip (see PANEL RESIZE). null = default sizing.
         panelSize: readPanelSize(parsed.panelSize),
+        // Points sell price ($ each) the Set-exchange-value tool multiplies
+        // the set's point reward by. Entered by hand (there's no reliable no-key points
+        // market feed); 0 until set. See renderSetProfit.
+        pointsSellPrice: Number.isFinite(Number(parsed.pointsSellPrice)) ? Math.max(0, Number(parsed.pointsSellPrice)) : 0,
       };
     } catch (e) {
-      return { feeMode: 'bazaar', collapsed: false, scanPageText: true, holdingsMode: 'separate', marketTaxHelper: true, marketQuality: true, trackTrades: true, manualScan: isPDA(), launcherMode: 'float', dockIndex: null, activeTab: 'main', panelPos: null, collapsedPos: null, panelSize: null };
+      return { feeMode: 'bazaar', collapsed: false, scanPageText: true, holdingsMode: 'separate', marketTaxHelper: true, marketQuality: true, trackTrades: true, tradeProbe: false, manualScan: isPDA(), launcherMode: 'float', dockIndex: null, activeTab: 'main', panelPos: null, collapsedPos: null, panelSize: null, pointsSellPrice: 0 };
     }
   }
 
@@ -417,7 +434,26 @@
     }
   }
 
+  // Disposals ledger load/save (mirror loadLots/saveLots). See DISPOSALS_KEY.
+  function loadDisposals() {
+    try {
+      const raw = Store.get(DISPOSALS_KEY, '[]');
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e) {
+      log('loadDisposals failed, resetting', e);
+      return [];
+    }
+  }
+  function saveDisposals() {
+    try {
+      Store.set(DISPOSALS_KEY, JSON.stringify(disposals));
+    } catch (e) {
+      log('saveDisposals failed', e);
+    }
+  }
   let lots = loadLots();
+  let disposals = loadDisposals();
   let settings = loadSettings();
 
   // On the PDA the app injects the user's own key into PDA_API_KEY for us, so there
@@ -450,9 +486,14 @@
       return {
         fetchedAt: typeof parsed.fetchedAt === 'number' ? parsed.fetchedAt : 0,
         names: parsed.names && typeof parsed.names === 'object' ? parsed.names : {},
+        // Per-item type + abroad (foreign-shop) buy price, kept so the
+        // Set-exchange-value tool can price plushie/flower sets at abroad cost without
+        // a second API call. meta[id] = { type, buy }. Empty on a catalog cached before
+        // this field existed - ensureItemCatalog refetches once to backfill it.
+        meta: parsed.meta && typeof parsed.meta === 'object' ? parsed.meta : {},
       };
     } catch (e) {
-      return { fetchedAt: 0, names: {} };
+      return { fetchedAt: 0, names: {}, meta: {} };
     }
   }
 
@@ -523,6 +564,28 @@
   // capped list of recent per-sale records for the detail view. Kept under a single
   // key so a sale updates both atomically and one cross-tab listener keeps another
   // open tab in sync. Totals accumulate; they are never recomputed from `recent`.
+  // Money input parser that understands Torn shorthand: "50k", "1.5m",
+  // "2b", "$4,517,899". The old strip-non-digits parse turned "50k" into $50.
+  // Returns NaN for empty/garbage so callers keep their own fallback.
+  function parseMoneyInput(s) {
+    const m = String(s == null ? '' : s).trim().toLowerCase().replace(/[$,\s]/g, '').match(/^(\d*\.?\d+)([kmb])?$/);
+    if (!m) return NaN;
+    return Number(m[1]) * ({ k: 1e3, m: 1e6, b: 1e9 }[m[2]] || 1);
+  }
+
+  // Local-calendar day key (YYYY-MM-DD) for the permanent per-day
+  // profit ledger. Local, not TCT/UTC: "how much did I make each day" reads as the
+  // player's own calendar day. Sortable as a plain string.
+  function dayKeyOf(ts) {
+    const d = new Date(Number(ts) || Date.now());
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+  function emptyDayBucket() {
+    return { profit: 0, proceeds: 0, cost: 0, fee: 0, count: 0 };
+  }
   function emptySalesTotals() {
     return {
       realizedProfit: 0, // matchedProceeds - matchedCost, the number the user asked for
@@ -542,9 +605,28 @@
       const parsed = JSON.parse(Store.get(SALES_KEY, '{}'));
       const totals = Object.assign(emptySalesTotals(), parsed && parsed.totals);
       const recent = Array.isArray(parsed && parsed.recent) ? parsed.recent : [];
-      return { totals, recent };
+      // Permanent per-day profit ledger, keyed YYYY-MM-DD. Unlike
+      // `recent` it is NEVER trimmed, so day-by-day history survives past the 200-row
+      // cap. On first load (no `daily` yet) seed it from whatever recent rows we still
+      // have so existing testers see history immediately; from then on recordSale
+      // maintains it and the recent cap stops mattering.
+      let daily = (parsed && parsed.daily && typeof parsed.daily === 'object' && !Array.isArray(parsed.daily)) ? parsed.daily : null;
+      if (!daily) {
+        daily = {};
+        for (const r of recent) {
+          const dk = dayKeyOf(r.ts);
+          let d = daily[dk];
+          if (!d) { d = emptyDayBucket(); daily[dk] = d; }
+          d.profit += Number(r.profit) || 0;
+          d.proceeds += Number(r.proceeds) || 0;
+          d.cost += Number(r.matchedCost) || 0;
+          d.fee += Number(r.fee) || 0;
+          d.count += 1;
+        }
+      }
+      return { totals, recent, daily };
     } catch (e) {
-      return { totals: emptySalesTotals(), recent: [] };
+      return { totals: emptySalesTotals(), recent: [], daily: {} };
     }
   }
   function saveSales(data) {
@@ -617,6 +699,26 @@
   let processedLogIds = loadProcessedLogIds();
   let processedLogIdSet = new Set(processedLogIds);
 
+  // One-time desktop repair. Cloud sync used to copy the WHOLE settings
+  // object between devices, so the PDA's "manual scan" default (on) landed on desktop
+  // and silently switched off desktop's API log poll - identical repeat buys (e.g. 3x
+  // "30 points from X") that the on-page path dedups then never got logged. Settings
+  // sync now keeps device-local fields (see CLOUD_DEVICE_LOCAL_SETTINGS); this clears
+  // the leaked value once. The log watermark is floored to "now" so the resumed poll
+  // does not deep-backfill days of buys the on-page path already logged. Store.set
+  // directly (not saveSettings) - cloudTouch is not safe to reach this early in init.
+  try {
+    if (!Store.get('flipr_manualscan_fix_v1', '') && !isPDA()) {
+      if (settings.manualScan) {
+        settings.manualScan = false;
+        Store.set(SETTINGS_KEY, JSON.stringify(settings));
+        logState = { lastTimestamp: Math.floor(Date.now() / 1000) };
+        Store.set(LOG_STATE_KEY, JSON.stringify(logState));
+      }
+      Store.set('flipr_manualscan_fix_v1', '1');
+    }
+  } catch (e) { log('manualScan repair failed', e); }
+
   function isLogIdProcessed(id) {
     return processedLogIdSet.has(String(id));
   }
@@ -666,6 +768,12 @@
     GM_addValueChangeListener(SALES_KEY, (name, oldValue, newValue, remote) => {
       if (!remote) return;
       salesData = loadSales();
+      renderAll();
+    });
+    // A disposal made in another tab: adopt the new ledger and re-render.
+    GM_addValueChangeListener(DISPOSALS_KEY, (name, oldValue, newValue, remote) => {
+      if (!remote) return;
+      disposals = loadDisposals();
       renderAll();
     });
     // Keep the "already stored" ledger in sync with whatever another open tab has
@@ -908,9 +1016,24 @@
   // save* wrappers) so it never triggers cloudTouch and loops back into a push.
   function cloudApplySnapshot(snap) {
     if (!snap || typeof snap !== 'object') return;
+    // Keep this device's own copy of device-local settings (scan mode,
+    // panel position/size, launcher, open tab). Adopting them from another device is
+    // how the PDA's manual-scan default switched off desktop's API poll.
+    const localSettings = loadSettings();
+    const localLogTs = loadLogState().lastTimestamp;
     for (const k of CLOUD_SYNC_KEYS) {
       if (typeof snap[k] === 'string') Store.set(k, snap[k]);
     }
+    // Never move this device's log watermark backwards: an older one from
+    // another device would make the next poll deep-backfill buys already logged here.
+    try {
+      if (loadLogState().lastTimestamp < localLogTs) Store.set(LOG_STATE_KEY, JSON.stringify({ lastTimestamp: localLogTs }));
+    } catch (e) { log('cloud log-state merge failed', e); }
+    try {
+      const merged = loadSettings();
+      for (const f of CLOUD_DEVICE_LOCAL_SETTINGS) merged[f] = localSettings[f];
+      Store.set(SETTINGS_KEY, JSON.stringify(merged));
+    } catch (e) { log('cloud settings merge failed', e); }
     lots = loadLots();
     settings = loadSettings();
     logState = loadLogState();
@@ -1153,13 +1276,20 @@
   // Grouped by item name AND stats (see statsKeyOf) - two differently-rolled
   // copies of the same weapon never get blended into one average, even in
   // "lump" mode, since that would erase exactly the distinction this is for.
+  // The ONE grouping key for "same item, same roll": a lump-mode row id is
+  // LUMP_ID_PREFIX + this, and every lump-row action (clear, dispose, edit price/qty,
+  // manual sell) resolves its lots with it - so the row and its actions can't disagree.
+  function lumpKeyOf(l) {
+    return normalize(l.itemName) + ' ' + (l.statsKey ?? '');
+  }
+
   function getHoldings() {
     const byItem = new Map();
     for (const lotEntry of lots) {
       if (lotEntry.qty <= 0) continue;
-      const key = normalize(lotEntry.itemName) + ' ' + (lotEntry.statsKey ?? '');
+      const key = lumpKeyOf(lotEntry);
       if (!byItem.has(key)) {
-        byItem.set(key, { itemName: lotEntry.itemName, qty: 0, totalCost: 0, stats: lotEntry.stats ?? null });
+        byItem.set(key, { key, itemName: lotEntry.itemName, qty: 0, totalCost: 0, stats: lotEntry.stats ?? null });
       }
       const h = byItem.get(key);
       h.qty += lotEntry.qty;
@@ -1195,7 +1325,9 @@
   function getDisplayEntries() {
     if (settings.holdingsMode === 'lump') {
       return getHoldings().map((h) => ({
-        id: LUMP_ID_PREFIX + normalize(h.itemName) + ' ' + (statsKeyOf(h.stats) ?? ''),
+        // Built from the stored per-lot key (not re-derived from h.stats) so a lot whose
+        // statsKey predates a statsKeyOf change still resolves from its row's buttons.
+        id: LUMP_ID_PREFIX + h.key,
         itemName: h.itemName,
         qty: h.qty,
         unitCost: h.avgCost,
@@ -1223,11 +1355,199 @@
   function clearEntry(id) {
     if (String(id).startsWith(LUMP_ID_PREFIX)) {
       const key = id.slice(LUMP_ID_PREFIX.length);
-      lots = lots.filter((l) => normalize(l.itemName) + ' ' + (l.statsKey ?? '') !== key);
+      lots = lots.filter((l) => lumpKeyOf(l) !== key);
       saveLots(lots);
     } else {
       removeLot(id);
     }
+  }
+
+  // Move an item out of Holdings as a non-market exit (traded in for
+  // points, or used). Resolves the clicked row exactly like clearEntry: one lot in
+  // "separate" mode, every lot of that item+stats combo in "lump" mode. Snapshots the
+  // removed lots so an undo re-adds them byte-for-byte. NEVER touches the frozen sales
+  // totals (a points trade is not a market sale). kind is 'points' today.
+  function recordDisposal(id, kind) {
+    const key = String(id).startsWith(LUMP_ID_PREFIX) ? id.slice(LUMP_ID_PREFIX.length) : null;
+    const taken = key != null
+      ? lots.filter((l) => l.qty > 0 && lumpKeyOf(l) === key)
+      : lots.filter((l) => l.id === id && l.qty > 0);
+    if (!taken.length) return null;
+    const snapshot = taken.map((l) => JSON.parse(JSON.stringify(l)));
+    const qty = snapshot.reduce((s, l) => s + (Number(l.qty) || 0), 0);
+    // Cost basis exactly as getHoldings books it: qty*unitCost, floored at 0. The
+    // mugCredit term is 0 in the public build (which carries no mug credits) and is
+    // kept only so this ports back cleanly if/when mug credits land on public lots.
+    const cost = snapshot.reduce((s, l) => s + Math.max(0, (Number(l.qty) || 0) * (Number(l.unitCost) || 0) - (Number(l.mugCredit) || 0)), 0);
+    disposals.push({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      ts: Date.now(),
+      itemName: snapshot[0].itemName,
+      statsKey: snapshot[0].statsKey ?? null,
+      qty,
+      cost,
+      kind: kind || 'points',
+      pointsValue: 0, // points received, if the user chooses to value it (click-to-edit)
+      lots: snapshot,
+    });
+    const takenIds = new Set(taken.map((l) => l.id));
+    lots = lots.filter((l) => !takenIds.has(l.id));
+    saveDisposals();
+    saveLots(lots);
+    return disposals[disposals.length - 1];
+  }
+
+  // Undo a disposal: put the snapshotted lots back exactly as they were and drop the record.
+  function removeDisposal(id) {
+    const idx = disposals.findIndex((d) => d.id === id);
+    if (idx < 0) return;
+    const d = disposals[idx];
+    // Reverse a museum CONVERSION fully: first take back the points it created in the
+    // Points tab (undoPointsPurchase mirrors the addPointsPurchase that processMuseum-
+    // Exchange ran), then re-add the snapshotted item lots to Holdings. Manual
+    // disposals have no pointsAdded, so this branch is a no-op for them.
+    if (d.pointsAdded && Number(d.pointsAdded.qty) > 0) {
+      undoPointsPurchase(Number(d.pointsAdded.qty), Number(d.pointsAdded.unitCost));
+    }
+    if (Array.isArray(d.lots)) {
+      for (const snap of d.lots) lots.push(JSON.parse(JSON.stringify(snap)));
+      saveLots(lots);
+    }
+    disposals.splice(idx, 1);
+    saveDisposals();
+  }
+
+  // Optional: record how many points a disposal yielded. Never touches the frozen sales totals.
+  function setDisposalPoints(id, pointsValue) {
+    const d = disposals.find((x) => x.id === id);
+    if (!d) return false;
+    d.pointsValue = Math.max(0, Number(pointsValue) || 0);
+    saveDisposals();
+    return true;
+  }
+
+  // Museum exchange auto-detect (user-log type 7000). A completed Museum
+  // exchange posts a log entry whose `data` names only the SET and the points earned,
+  // NOT the component items:
+  //   data: { set: "Plushie Set", quantity: 1, points_received: 10 }
+  // (confirmed live via the captureLogShape diagnostic, v2.48.4-test). So FLIPR infers
+  // which HELD items the set consumed from the set name - plushies by their "... Plushie"
+  // name, flowers by a known list, a single-item artifact by the set name itself - and
+  // moves one of each per set out of Holdings into the disposals ledger, pre-filling the
+  // points received. One ledger record per exchange, fully undoable (snapshot lots),
+  // and it never touches the frozen sales totals (see [[flipr-profits-frozen-totals]]).
+  const MUSEUM_EXCHANGE_LOG_TYPE_ID = 7000;
+  // Torn's collectible flowers (the museum flower set members). A flower not listed here
+  // simply won't be auto-moved - harmless, and still recoverable with the manual ⇄.
+  const MUSEUM_FLOWER_NAMES = new Set([
+    'dahlia', 'crocus', 'orchid', 'heather', 'ceibo flower', 'peony', 'edelweiss',
+    'cherry blossom', 'banana orchid', 'african violet', 'tribulus omanense',
+  ].map(normalize));
+  // Given a museum set name, return a predicate matching the held items it consumes,
+  // or null when the set name is empty.
+  function museumSetMatcher(setName) {
+    const s = normalize(setName);
+    if (!s) return null;
+    if (/plushie/.test(s)) return (name) => /plushie$/.test(normalize(name));
+    if (/flower/.test(s)) return (name) => MUSEUM_FLOWER_NAMES.has(normalize(name));
+    // Single-item artifact exchange: the set name IS the item (with or without a
+    // trailing " Set"). Match that exact held item only.
+    const bare = s.replace(/\s+set$/, '').trim();
+    return (name) => { const n = normalize(name); return n === s || n === bare; };
+  }
+
+  // Turn one confirmed Museum-exchange log entry into a single disposals record,
+  // consuming one matching held item per set exchanged (FIFO within each item).
+  // Returns the record, or null if nothing we hold matched (nothing to move out).
+  function processMuseumExchange(entry) {
+    const data = (entry && entry.data) || {};
+    const setName = String(data.set || '').trim();
+    const sets = Math.max(1, Math.floor(Number(data.quantity) || 1));
+    const points = Math.max(0, Number(data.points_received) || 0);
+    const matcher = museumSetMatcher(setName);
+    if (!matcher) return null;
+
+    // Group the matching, in-stock lots by item (name + stats), so one of EACH
+    // matching item is taken per set (a set needs one of each member).
+    const byItem = new Map();
+    for (const l of lots) {
+      if (!((Number(l.qty) || 0) > 0) || !matcher(l.itemName)) continue;
+      const k = lumpKeyOf(l);
+      if (!byItem.has(k)) byItem.set(k, []);
+      byItem.get(k).push(l);
+    }
+    if (!byItem.size) { Diag.bump('museumNoHeldMatch'); return null; }
+
+    const snapshot = [];
+    const removeIds = new Set();
+    let totalQty = 0;
+    let totalCost = 0;
+    for (const group of byItem.values()) {
+      group.sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0)); // oldest first (FIFO)
+      let need = sets;
+      for (const lot of group) {
+        if (need <= 0) break;
+        const have = Number(lot.qty) || 0;
+        const take = Math.min(have, need);
+        if (take <= 0) continue;
+        const unitCost = Number(lot.unitCost) || 0;
+        const copy = JSON.parse(JSON.stringify(lot));
+        copy.qty = take;
+        // Fresh id so undo (removeDisposal re-pushes the snapshot) can't collide with a
+        // lot we only partially consumed and left in Holdings.
+        copy.id = `mx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        snapshot.push(copy);
+        totalQty += take;
+        totalCost += Math.max(0, take * unitCost - (Number(lot.mugCredit) || 0));
+        if (take >= have) removeIds.add(lot.id);
+        else lot.qty = have - take;
+        need -= take;
+      }
+    }
+    if (!snapshot.length) return null;
+
+    lots = lots.filter((l) => !removeIds.has(l.id));
+    // A museum exchange is a CONVERSION, not a loss: the items you
+    // consumed BECOME the points you received, so their cost basis moves ONTO those
+    // points - added to the Points tab's pointsLots (addPointsPurchase, so it merges
+    // with any same-price points lot exactly like a bought-points add). That keeps ALL
+    // points P&L - including these exchanged points - on the Points tab and its existing
+    // Sell Check, and leaves this Profits-tab disposal record with no cost (recCost 0)
+    // so nothing points-related reads as profit/loss over here. pointsAdded remembers
+    // the lot we created so removeDisposal (undo) can take it back out again. When the
+    // exchange yielded 0 points it's a plain "used" item, so the cost stays on Profits.
+    let pointsAdded = null;
+    let recCost = totalCost;
+    if (points > 0) {
+      const ptUnitCost = totalCost / points;
+      addPointsPurchase(points, ptUnitCost);
+      pointsAdded = { qty: points, unitCost: ptUnitCost };
+      recCost = 0;
+    }
+    const rec = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      ts: (Number(entry && entry.timestamp) || Math.floor(Date.now() / 1000)) * 1000,
+      itemName: setName || 'Museum exchange',
+      statsKey: null,
+      qty: totalQty,
+      cost: recCost,
+      kind: 'museum',
+      pointsValue: points,
+      sets, // pointsValue covers ALL `sets` exchanged; learnedSetPayout divides by this
+      lots: snapshot,
+      auto: true,
+      pointsAdded,
+    };
+    disposals.push(rec);
+    saveDisposals();
+    saveLots(lots);
+    Diag.bump('museumMoved');
+    renderAll();
+    const label = points > 0
+      ? `Museum exchange: ${rec.itemName} → Traded for Points (+${points} pts)`
+      : `Museum exchange: ${rec.itemName} → Traded for Points / Used`;
+    showToast(label, () => removeDisposal(rec.id));
+    return rec;
   }
 
   // Correcting a price by hand. Needed because a mis-read purchase used to leave you
@@ -1244,7 +1564,7 @@
       const key = id.slice(LUMP_ID_PREFIX.length);
       let touched = false;
       for (const l of lots) {
-        if (normalize(l.itemName) + ' ' + (l.statsKey ?? '') === key) { l.unitCost = unitCost; touched = true; }
+        if (lumpKeyOf(l) === key) { l.unitCost = unitCost; touched = true; }
       }
       if (touched) saveLots(lots);
       return touched;
@@ -1271,7 +1591,7 @@
     if (String(id).startsWith(LUMP_ID_PREFIX)) {
       const key = id.slice(LUMP_ID_PREFIX.length);
       const group = lots
-        .filter((l) => normalize(l.itemName) + ' ' + (l.statsKey ?? '') === key && l.qty > 0)
+        .filter((l) => lumpKeyOf(l) === key && l.qty > 0)
         .sort((a, b) => a.ts - b.ts); // FIFO
       const total = group.reduce((s, l) => s + l.qty, 0);
       if (newQty >= total) return false; // a blended row can only be corrected DOWN
@@ -1294,10 +1614,114 @@
     return true;
   }
 
-  // Swaps a Holdings row's price text for an input. Enter or clicking away saves,
-  // Escape cancels. Commit-on-blur is deliberate: the common case is typing a number and
-  // clicking back onto the page, and losing that silently would be worse than the rare
-  // accidental save, which Escape and a re-edit both undo.
+  // Take one recorded sale back OUT of the frozen totals and its day bucket - the exact
+  // inverse of recordSale's accumulation. Shared by reverseSale (one row) and
+  // cleanupOldTrades (bulk) so the two reversals can't drift apart. Does NOT touch
+  // salesData.recent or any lots - the callers own that.
+  function unbookSale(r) {
+    const qty = Number(r.qty) || 0;
+    const proceeds = Number(r.proceeds) || 0;
+    const fee = Number(r.fee) || 0;
+    const profit = Number(r.profit) || 0;
+    const mQty = Number(r.matchedQty) || 0;
+    const mCost = Number(r.matchedCost) || 0;
+    const uQty = Math.max(0, qty - mQty);
+    const unit = qty > 0 ? proceeds / qty : 0;
+    const t = salesData.totals;
+    t.realizedProfit -= profit;
+    t.matchedProceeds -= unit * mQty;
+    t.matchedCost -= mCost;
+    t.matchedQty -= mQty;
+    t.untrackedProceeds -= unit * uQty;
+    t.untrackedQty -= uQty;
+    t.feePaid -= fee;
+    t.salesCount = Math.max(0, (Number(t.salesCount) || 0) - 1);
+    const key = dayKeyOf(r.ts);
+    const day = salesData.daily && salesData.daily[key];
+    if (day) {
+      day.profit -= profit;
+      day.proceeds -= proceeds;
+      day.cost -= mCost;
+      day.fee -= fee;
+      day.count = Math.max(0, (day.count || 0) - 1);
+      if (day.count <= 0) delete salesData.daily[key];
+    }
+  }
+
+  // Delete a sale from Recent Sales and put everything back as if it
+  // never happened: totals + daily bucket reversed (same arithmetic as the
+  // cleanupOldTrades sell-reversal), the record removed, and the matched units
+  // returned to Holdings (or the points tracker) at the cost they were booked at.
+  // Undo restores the exact pre-delete snapshot.
+  function reverseSale(rec) {
+    // Match by object identity: older records may predate the `id` field.
+    const idx = salesData.recent.indexOf(rec);
+    if (idx < 0) return;
+    const snap = {
+      lots: JSON.parse(JSON.stringify(lots)),
+      pointsLots: JSON.parse(JSON.stringify(pointsLots)),
+      sales: JSON.parse(JSON.stringify(salesData)),
+    };
+    const r = salesData.recent[idx];
+    const qty = Number(r.qty) || 0;
+    const mQty = Number(r.matchedQty) || 0;
+    const mCost = Number(r.matchedCost) || 0;
+    unbookSale(r);
+    salesData.recent.splice(idx, 1);
+    let restored = '';
+    if (mQty > 0) {
+      if (r.market === 'points') {
+        addPointsPurchase(mQty, mCost / mQty);
+        restored = ` · ${mQty} back in Points`;
+      } else {
+        addLot(r.itemName, mQty, mCost / mQty, 'restored', r.stats);
+        restored = ` · ${mQty} back in Holdings`;
+      }
+    }
+    saveLots(lots);
+    saveSales(salesData);
+    renderAll();
+    showToast(`Deleted sale: ${r.itemName} ×${qty}${restored}`, () => {
+      lots = snap.lots;
+      pointsLots = snap.pointsLots;
+      salesData = snap.sales;
+      saveLots(lots);
+      savePointsStats(pointsLots);
+      saveSales(salesData);
+      renderAll();
+    });
+  }
+
+  // Shared plumbing for every click-to-edit cell (cost basis, price, count, manual
+  // sell, disposal points): swaps `target` for a text box; Enter or clicking away
+  // commits, Escape cancels, and it settles exactly once. onCommit gets the raw text;
+  // `after` redraws (renderAll unless the caller needs something narrower).
+  function startInlineEdit(target, opts, onCommit, after) {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'flipr-price-edit';
+    if (opts.width) input.style.width = opts.width;
+    if (opts.value != null) input.value = opts.value;
+    if (opts.placeholder) input.placeholder = opts.placeholder;
+    input.title = opts.title;
+    target.replaceWith(input);
+    input.focus();
+    input.select();
+    let done = false;
+    const finish = (commit) => {
+      if (done) return;
+      done = true;
+      if (commit) onCommit(input.value);
+      (after || renderAll)();
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+      else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    });
+    input.addEventListener('blur', () => finish(true));
+    return input;
+  }
+
   // Click a "no basis" sale row to record what the item actually cost you - loot, old
   // stock, pre-install, gifts: anything FLIPR never logged a buy for. DISPLAY-ONLY: it
   // shows a real profit on the row (proceeds - cost) but is deliberately kept OUT of the
@@ -1306,96 +1730,93 @@
   // from salesData.recent (renderProfits spreads the array but keeps object refs), so
   // mutating it here and calling saveSales persists the change.
   function startManualCostEdit(metaSpan, rec) {
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.className = 'flipr-price-edit';
-    input.value = Number.isFinite(Number(rec.manualCost)) ? String(Math.round(Number(rec.manualCost))) : '';
-    input.placeholder = 'cost basis';
-    input.title = 'Enter to save, Escape to cancel, blank to clear';
-    metaSpan.replaceWith(input);
-    input.focus();
-    input.select();
-    let done = false;
-    const finish = (commit) => {
-      if (done) return;
-      done = true;
-      if (commit) {
-        const raw = String(input.value).trim();
-        if (raw === '') delete rec.manualCost;
-        else rec.manualCost = Math.max(0, Number(raw.replace(/[^0-9.]/g, '')) || 0);
-        saveSales(salesData);
-      }
-      renderAll();
-    };
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
-      else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    startInlineEdit(metaSpan, {
+      value: Number.isFinite(Number(rec.manualCost)) ? String(Math.round(Number(rec.manualCost))) : '',
+      placeholder: 'cost basis',
+      title: 'Enter to save, Escape to cancel, blank to clear',
+    }, (val) => {
+      const raw = String(val).trim();
+      if (raw === '') delete rec.manualCost;
+      else rec.manualCost = Math.max(0, parseMoneyInput(raw) || 0);
+      saveSales(salesData);
     });
-    input.addEventListener('blur', () => finish(true));
   }
 
+  // Swaps a Holdings row's price text for an input. Commit-on-blur is deliberate: the
+  // common case is typing a number and clicking back onto the page, and losing that
+  // silently would be worse than the rare accidental save, which Escape and a re-edit
+  // both undo.
   function startPriceEdit(metaSpan, entry) {
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.className = 'flipr-price-edit';
-    input.value = String(Math.round(entry.unitCost));
-    input.title = 'Enter to save, Escape to cancel';
-    metaSpan.replaceWith(input);
-    input.focus();
-    input.select();
-    let done = false;
-    const finish = (commit) => {
-      if (done) return;
-      done = true;
-      if (commit) {
-        // Tolerate whatever gets pasted in: "$4,517,899" and "4517899" both work.
-        const v = Number(String(input.value).replace(/[^0-9.]/g, ''));
-        if (Number.isFinite(v) && v >= 0) setEntryUnitCost(entry.id, v);
-      }
-      renderAll();
-    };
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
-      else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    startInlineEdit(metaSpan, {
+      value: String(Math.round(entry.unitCost)),
+      title: 'Enter to save, Escape to cancel',
+    }, (val) => {
+      // Tolerate whatever gets pasted in: "$4,517,899" and "4517899" both work.
+      const v = parseMoneyInput(val);
+      if (Number.isFinite(v) && v >= 0) setEntryUnitCost(entry.id, v);
     });
-    input.addEventListener('blur', () => finish(true));
   }
 
-  // Same inline-edit dance as startPriceEdit, but for the COUNT - swap the "\\u00D7N"
+  // Same inline edit as startPriceEdit, but for the COUNT - swap the "\u00D7N"
   // for a small number box so an untracked sale can be corrected by hand (bought 10,
   // quietly sold 5, type 5). The per-unit price is left alone, so the row's money just
   // follows the new count. A blended ("lump") row can only be corrected DOWNward and
   // setEntryQty refuses anything else; that refusal is surfaced as a toast so the edit
   // doesn't look like it silently did nothing.
   function startQtyEdit(qtySpan, entry) {
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.className = 'flipr-price-edit';
-    input.style.width = '3.5em';
-    input.value = String(entry.qty);
-    input.title = 'Enter to save, Escape to cancel';
-    qtySpan.replaceWith(input);
-    input.focus();
-    input.select();
-    let done = false;
-    const finish = (commit) => {
-      if (done) return;
-      done = true;
-      if (commit) {
-        const v = Math.floor(Number(String(input.value).replace(/[^0-9]/g, '')));
-        if (Number.isFinite(v) && v >= 0 && v !== entry.qty) {
-          if (!setEntryQty(entry.id, v) && entry.isLump) {
-            showToast(`Enter a number below ${entry.qty} - a blended row can only be corrected down.`);
-          }
+    startInlineEdit(qtySpan, {
+      width: '3.5em',
+      value: String(entry.qty),
+      title: 'Enter to save, Escape to cancel',
+    }, (val) => {
+      const v = Math.floor(Number(String(val).replace(/[^0-9]/g, '')));
+      if (Number.isFinite(v) && v >= 0 && v !== entry.qty) {
+        if (!setEntryQty(entry.id, v) && entry.isLump) {
+          showToast(`Enter a number below ${entry.qty} - a blended row can only be corrected down.`);
         }
       }
-      renderAll();
-    };
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
-      else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
     });
-    input.addEventListener('blur', () => finish(true));
+  }
+
+  // Manual sale entry - the safety net for the times auto-detect misses a
+  // trade (the tester: "a way to insert that sell manually ... I put the sell price and
+  // voila the profit"). Replaces the price cell with a sell-price box; Enter books a sale
+  // at fee 0 - a hand-entered / P2P sale carries NO Item Market tax - for the whole row's
+  // qty via recordSale, which consumes THIS row's lot(s) first (the `prefer` predicate)
+  // and records the profit exactly the way an auto-detected sale would. Fully
+  // reversible: a deep snapshot of lots + sales is restored by the toast's Undo, so a
+  // mistyped price costs nothing. Price entered is PER UNIT (matches how the buy price
+  // reads), so proceeds = price x qty.
+  function startSellEntry(metaSpan, entry) {
+    startInlineEdit(metaSpan, {
+      placeholder: 'sell $',
+      title: entry.qty > 1
+        ? `Sell price PER UNIT (\u00D7${entry.qty}) - Enter to record the sale, Escape to cancel`
+        : 'Sell price - Enter to record the sale, Escape to cancel',
+    }, (val) => {
+      if (String(val).trim() === '') return;
+      // Tolerate "$1,250,000" and "1250000" alike, same as the price editor.
+      const unit = parseMoneyInput(val);
+      if (!(Number.isFinite(unit) && unit >= 0)) return;
+      const qty = entry.qty;
+      const proceeds = unit * qty;
+      // Deep snapshot BEFORE the sale so Undo restores both sides byte-for-byte
+      // (recordSale mutates lots via consumeLotsForSale AND grows salesData).
+      const lotsBackup = JSON.parse(JSON.stringify(lots));
+      const salesBackup = JSON.parse(JSON.stringify(salesData));
+      const rowKey = entry.isLump ? String(entry.id).slice(LUMP_ID_PREFIX.length) : null;
+      const prefer = rowKey != null ? (l) => lumpKeyOf(l) === rowKey : (l) => l.id === entry.id;
+      const rec = recordSale(entry.itemName, qty, proceeds, 0, 'manual', Math.floor(Date.now() / 1000), null, prefer);
+      if (rec) {
+        const p = rec.profit;
+        const verb = p >= 0 ? 'profit' : 'loss';
+        showToast(`${entry.itemName}: sold for ${money(proceeds)} \u00B7 ${money(Math.abs(p))} ${verb}.`, () => {
+          lots = lotsBackup; saveLots(lots);
+          salesData = salesBackup; saveSales(salesData);
+          renderAll();
+        });
+      }
+    });
   }
 
   // Loose match used for scanning page text: exact normalized match first,
@@ -1503,6 +1924,30 @@
     saveLots(lots);
   }
 
+  // One-time migration for museum exchanges recorded BEFORE a museum
+  // exchange was treated as a conversion into Points-tab holdings. Those older records
+  // kept the item cost on the Profits-tab disposal and never added the received points
+  // to the Points tab, so the points the tester already exchanged didn't show up under
+  // Points Held. Fold each such record in the same way processMuseumExchange now does:
+  // push the points onto pointsLots carrying the item cost as basis, stamp pointsAdded
+  // (so undo can reverse it), and zero the disposal's cost (it moved to the points).
+  // Idempotent: a record that already has pointsAdded, or yielded 0 points, is skipped.
+  function migrateMuseumDisposalsToPoints() {
+    let changed = false;
+    for (const d of disposals) {
+      if (!d || d.kind !== 'museum' || d.pointsAdded) continue;
+      const pts = Number(d.pointsValue) || 0;
+      if (!(pts > 0)) continue;
+      const cost = Number(d.cost) || 0;
+      const ptUnitCost = cost / pts;
+      addPointsPurchase(pts, ptUnitCost);
+      d.pointsAdded = { qty: pts, unitCost: ptUnitCost };
+      d.cost = 0;
+      changed = true;
+    }
+    if (changed) saveDisposals();
+  }
+
   ////////////////////////////////////////////////////////////////////////////
   ////  SALES TRACKER (realized profit)
   ////////////////////////////////////////////////////////////////////////////
@@ -1531,7 +1976,12 @@
   // A sale of crime/OC loot, or of anything bought before FLIPR was installed, matches
   // nothing and comes back all-untracked - honest, not a bug. The consumed lot's stats
   // ride along only for display.
-  function consumeLotsForSale(itemName, qty, saleUid) {
+  // `prefer` (optional) is a lot predicate: matching lots are consumed FIRST (still
+  // oldest-first among themselves), then plain FIFO for any remainder. Only the manual
+  // "sell this row" entry passes it, so the row you clicked is the one that sells -
+  // before 2.48.19-test a manual sell on a newer / differently-rolled row booked the
+  // OLDEST same-name lot's cost instead. Auto-detected sales pass nothing (unchanged).
+  function consumeLotsForSale(itemName, qty, saleUid, prefer) {
     const key = normalize(itemName);
     let remaining = qty;
     let matchedQty = 0;
@@ -1558,7 +2008,7 @@
     if (remaining > 0) {
       const candidates = lots
         .filter((l) => l.qty > 0 && normalize(l.itemName) === key)
-        .sort((a, b) => a.ts - b.ts);
+        .sort((a, b) => (prefer ? (prefer(a) ? 0 : 1) - (prefer(b) ? 0 : 1) : 0) || a.ts - b.ts);
       for (const lot of candidates) {
         if (remaining <= 0) break;
         const take = Math.min(lot.qty, remaining);
@@ -1589,7 +2039,7 @@
   // `market` is 'item' | 'bazaar' | 'points'. Points never match a lot in v1 (the
   // Points tab tracks lifetime purchases, not consumable holdings), so they land
   // wholly in the untracked bucket - fine, this account sold points once in 5 months.
-  function recordSale(itemName, qty, proceeds, fee, market, tsSeconds, saleUid) {
+  function recordSale(itemName, qty, proceeds, fee, market, tsSeconds, saleUid, prefer) {
     itemName = String(itemName || '').trim();
     qty = Number(qty);
     proceeds = Number(proceeds);
@@ -1599,7 +2049,7 @@
     const { matchedQty, matchedCost, matchedStats } =
       market === 'points'
         ? Object.assign({ matchedStats: null }, consumePointsForSale(qty))
-        : consumeLotsForSale(itemName, qty, saleUid);
+        : consumeLotsForSale(itemName, qty, saleUid, prefer);
     const unitProceeds = proceeds / qty;
     const matchedProceeds = unitProceeds * matchedQty;
     const untrackedQty = qty - matchedQty;
@@ -1618,6 +2068,21 @@
     t.salesCount += 1;
     t.firstTs = t.firstTs === null ? ts : Math.min(t.firstTs, ts);
     t.lastTs = t.lastTs === null ? ts : Math.max(t.lastTs, ts);
+
+    // Permanent per-day ledger - same frozen-accumulator pattern as the
+    // totals above: a day bucket only ever grows here (and reverses in cleanup), never
+    // recomputed from `recent`, so daily P/L outlives the 200-row recent cap. `proceeds`
+    // is the full net sale; `profit`/`cost` are the flip-matched portion (manual cost
+    // bases are folded in at render time the same way the headline folds them).
+    if (!salesData.daily) salesData.daily = {};
+    const dk = dayKeyOf(ts);
+    let day = salesData.daily[dk];
+    if (!day) { day = emptyDayBucket(); salesData.daily[dk] = day; }
+    day.profit += profit;
+    day.proceeds += proceeds;
+    day.cost += matchedCost;
+    day.fee += fee;
+    day.count += 1;
 
     const record = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -1647,7 +2112,7 @@
   }
 
   function clearSalesHistory() {
-    salesData = { totals: emptySalesTotals(), recent: [] };
+    salesData = { totals: emptySalesTotals(), recent: [], daily: {} };
     Store.del(SALES_KEY);
   }
 
@@ -1673,6 +2138,7 @@
       if (!snap || !Array.isArray(snap.lots) || !snap.sales) { console.log('%c[FLIPR cleanup] no backup to restore', 'color:#e66'); return; }
       lots = snap.lots;
       salesData = snap.sales;
+      if (!salesData.daily) salesData.daily = {}; // older backups predate the daily ledger
       saveLots(lots);
       saveSales(salesData);
       renderAll();
@@ -1705,21 +2171,8 @@
     lots = lots.filter((l) => !removeIds.has(l.id));
     saveLots(lots);
 
-    const t = salesData.totals;
-    for (const r of sellRows) {
-      const qty = Number(r.qty) || 0;
-      const unit = qty > 0 ? (Number(r.proceeds) || 0) / qty : 0;
-      const mQty = Number(r.matchedQty) || 0;
-      const uQty = qty - mQty;
-      t.realizedProfit -= Number(r.profit) || 0;
-      t.matchedProceeds -= unit * mQty;
-      t.matchedCost -= Number(r.matchedCost) || 0;
-      t.matchedQty -= mQty;
-      t.untrackedProceeds -= unit * uQty;
-      t.untrackedQty -= uQty;
-      t.feePaid -= Number(r.fee) || 0;
-      t.salesCount = Math.max(0, (Number(t.salesCount) || 0) - 1);
-    }
+    // Totals + the per-day ledger, so a cleaned-up trade sell leaves no phantom profit.
+    for (const r of sellRows) unbookSale(r);
     const sellIds = new Set(sellRows.map((r) => r.id));
     salesData.recent = (salesData.recent || []).filter((r) => !sellIds.has(r.id));
     saveSales(salesData);
@@ -1828,6 +2281,9 @@
 
   const money = (n) => '$' + Math.round(n).toLocaleString('en-US');
   const pct = (n) => (n >= 0 ? '+' : '') + n.toFixed(1) + '%';
+  // " (+12.3%)" of `cost`, or '' when cost is 0 (a free / zero-basis lot would
+  // otherwise print "Infinity%" or "NaN%").
+  const pctOfCost = (profit, cost) => (cost > 0 ? ` (${pct((profit / cost) * 100)})` : '');
 
   ////////////////////////////////////////////////////////////////////////////
   ////  UI - STYLES
@@ -1910,6 +2366,8 @@
       background: #1a1a1a; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 1px 7px;
       font: inherit; }
     .flipr-row input.flipr-input-price { flex: 0 0 110px; text-align: center; }
+    .flipr-sale-del { flex: 0 0 auto; margin-left: 6px; color: #777; cursor: pointer; font-size: 11px; padding: 0 2px; }
+    .flipr-sale-del:hover { color: #e66; }
     .flipr-row input.flipr-input-qty { flex: 0 0 90px; text-align: center; }
     .flipr-checkbox-row { display: flex; align-items: center; gap: 6px; color: #bbb; cursor: pointer; }
     .flipr-checkbox-row input { margin: 0; }
@@ -1932,8 +2390,6 @@
       padding: 0 3px; }
     .flipr-empty { color: #777; font-style: italic; }
     .flipr-result { margin-top: 6px; padding: 8px; border-radius: 4px; background: #1a1a1a; }
-    .flipr-result.flipr-profit { border-left: 3px solid #3fb950; }
-    .flipr-result.flipr-loss { border-left: 3px solid #e5534b; }
     .flipr-result .flipr-verdict { font-weight: bold; }
     .flipr-result.flipr-profit .flipr-verdict { color: #3fb950; }
     .flipr-result.flipr-loss .flipr-verdict { color: #e5534b; }
@@ -1955,6 +2411,33 @@
     .flipr-fee-toggle { display: flex; flex-wrap: wrap; gap: 6px 10px; font-size: 11px; color: #bbb; margin-bottom: 8px; }
     .flipr-fee-toggle label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
     .flipr-hint { color: #888; font-size: 10px; margin: 2px 0 8px; }
+    /* "?" help chips: the panel keeps one short line per control; the full
+       explanation opens in one shared card (#flipr-help) on tap. A chip sits
+       BESIDE a checkbox label, never inside it, so tapping it can't toggle the box. */
+    .flipr-opt { display: flex; align-items: center; gap: 4px; }
+    .flipr-opt .flipr-checkbox-row { flex: 1; min-width: 0; }
+    .flipr-q { display: inline-flex; align-items: center; justify-content: center;
+      width: 14px; height: 14px; margin-left: 5px; border-radius: 50%; flex: 0 0 auto;
+      background: #34557a; color: #fff; font-size: 9px; font-weight: bold; font-style: normal;
+      text-transform: none; letter-spacing: 0; cursor: pointer; user-select: none;
+      vertical-align: middle; }
+    .flipr-q:hover { background: #2f6fbf; }
+    .flipr-q.flipr-q-on { background: #6fa8dc; color: #1a1a1a; }
+    #flipr-help { position: fixed; z-index: 1000001; display: none; width: 250px;
+      max-height: 70vh; overflow-y: auto; -webkit-overflow-scrolling: touch;
+      overscroll-behavior: contain; background: #333; color: #ddd; border: 1px solid #111;
+      border-radius: 8px; box-shadow: 0 8px 28px rgba(0,0,0,0.7); padding: 0 12px 12px;
+      font-size: 11px; line-height: 1.45; box-sizing: border-box; }
+    #flipr-help.flipr-open { display: block; }
+    #flipr-help h4 { position: sticky; top: 0; background: #333; z-index: 1;
+      margin: 0 -12px 5px; padding: 10px 12px 6px; font-size: 11px; color: #6fa8dc;
+      text-transform: uppercase; letter-spacing: 0.03em;
+      display: flex; justify-content: space-between; align-items: center; }
+    #flipr-help .flipr-help-close { cursor: pointer; color: #999; font-size: 20px; line-height: 1;
+      padding: 0 4px; margin: -4px -4px -4px 8px; }
+    #flipr-help .flipr-help-close:hover { color: #fff; }
+    #flipr-help p { margin: 0 0 6px; }
+    #flipr-help p:last-child { margin-bottom: 0; }
     .flipr-debug-textarea { width: 100%; height: 90px; margin-top: 6px; background: #1a1a1a; color: #ddd;
       border: 1px solid #444; border-radius: 4px; font-size: 10px; padding: 6px; box-sizing: border-box; }
     .flipr-tabs { display: flex; gap: 4px; margin-bottom: 16px; }
@@ -1972,6 +2455,7 @@
     #flipr-tax-popover .flipr-tax-close { position: absolute; top: 3px; right: 7px; color: #888;
       cursor: pointer; font-size: 14px; line-height: 1; }
     #flipr-tax-popover .flipr-tax-close:hover { color: #ccc; }
+
 
     /* ================= THEME: Torn Native (private palette) ================= */
     :root { --flipr-pos: #8fc63f; --flipr-neg: #e5534b; --flipr-link: #74c0fc; }
@@ -2027,8 +2511,8 @@
     .flipr-btn.flipr-btn-danger { background: linear-gradient(180deg, #a63c33 0%, #7e2b25 50%, #5f1f1b 100%); border-color: #3a1210; }
     .flipr-btn.flipr-btn-danger:hover { background: linear-gradient(180deg, #bb483e 0%, #8e322b 50%, #6b2420 100%); }
     .flipr-result { background: #232323; border: 1px solid #1a1a1a; border-radius: 4px; }
-    .flipr-result.flipr-profit { border-left: 3px solid var(--flipr-pos); background: linear-gradient(90deg, rgba(143,198,63,0.13), #232323 65%); }
-    .flipr-result.flipr-loss { border-left: 3px solid var(--flipr-neg); background: linear-gradient(90deg, rgba(229,83,75,0.13), #232323 65%); }
+    .flipr-result.flipr-profit { background: linear-gradient(90deg, rgba(143,198,63,0.13), #232323 65%); }
+    .flipr-result.flipr-loss { background: linear-gradient(90deg, rgba(229,83,75,0.13), #232323 65%); }
     .flipr-result.flipr-profit .flipr-verdict { color: var(--flipr-pos); }
     .flipr-result.flipr-loss .flipr-verdict { color: var(--flipr-neg); }
     .flipr-q { background: #565656; color: #eee; box-shadow: inset 0 1px 0 rgba(255,255,255,0.14); }
@@ -2095,7 +2579,6 @@
     .flipr-body, #flipr-holdings, #flipr-help { scrollbar-color: #3a3a3a transparent; }
     .flipr-body::-webkit-scrollbar-thumb, #flipr-holdings::-webkit-scrollbar-thumb, #flipr-help::-webkit-scrollbar-thumb {
       background: #3a3a3a; border-color: #1c1c1c; }
-
     /* ---- light mode (Torn light theme only; dark mode unchanged) ---- */
     body:not(.dark-mode) { --flipr-pos: #3a8a1e; --flipr-neg: #c8352d; --flipr-link: #1f7a7a; }
     body:not(.dark-mode) #flipr-panel { background: #f2f2f2; color: #333; border-color: #c4c4c4; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.6), 0 6px 20px rgba(0,0,0,0.22); }
@@ -2156,6 +2639,54 @@
   ////  UI - PANEL
   ////////////////////////////////////////////////////////////////////////////
 
+  // "?" help. Each control keeps a one-line hint in the panel; the longer "what is
+  // this / what do the symbols mean" lives here and opens in one shared card when
+  // its chip is tapped (same idea as BUSTR's help chips). Values are [title, html].
+  // Pure-ASCII: symbols are HTML entities.
+  const FLIPR_HELP = {
+    holdings: ['Holdings', '<p>Everything FLIPR saw you buy and still hold, with what you paid.</p>'
+      + '<p>Tap the price or &times;qty to correct it. Row buttons: <b>$</b> record a sale by hand (price each, no tax) &middot; '
+      + '<b>&#x21C4;</b> used / traded in for points (moves it to Profits) &middot; <b>&#x2715;</b> remove.</p>'
+      + '<p><b>Lump</b> merges the same item into one row at the average price.</p>'
+      + '<p><b>+ Add a holding by hand</b> adds something FLIPR never saw you buy (older stock, or a missed buy): item, qty and what you paid each. Its sales then show a real profit.</p>'],
+    sellcheck: ['Sell Check', '<p>Pick something you hold, type a listing price and qty, and see your profit after tax.</p>'
+      + '<p>Tax: Bazaar 0%, Item Market 5%, Anonymous 15%.</p>'],
+    realized: ['Realized profit', '<p>Logged automatically when your listing sells (needs your API key). Profit = what you got after tax, minus what you paid.</p>'
+      + '<p><b>No basis</b> = FLIPR never saw you buy it (loot, old stock). Tap that sale in Recent Sales to enter what it cost you and it counts here.</p>'],
+    daily: ['Profit by day', '<p>Each day&#39;s profit or loss, newest first. &#x2605; = best day, &#x26A0; = worst.</p>'
+      + '<p>Hover a day for its sale count and amount sold. Kept permanently from now on; older days aren&#39;t shown.</p>'],
+    disposals: ['Traded for Points / Used', '<p>Items you used or traded in instead of selling, so they stop sitting in Holdings as unsold. Move one here with <b>&#x21C4;</b> on its Holdings row; Museum set exchanges move automatically.</p>'
+      + '<p>Its cost is kept but not counted as a sale. Tap a row to note points received; <b>&#x2715;</b> puts it back in Holdings.</p>'],
+    recent: ['Recent Sales', '<p>Your latest sales, newest first. Green = profit, red = loss.</p>'
+      + '<p><b>no basis</b> = no recorded buy price - tap it to enter one. <b>&#x2715;</b> deletes a wrong sale and returns the items to Holdings (Undo on the popup).</p>'],
+    points: ['Points Held', '<p>Points you bought on the Points Market, with what they cost you. Museum exchanges add their points here at the cost of the items you traded in.</p>'],
+    pointscheck: ['Points Sell Check', '<p>Type a listing price and qty to see profit against what your points cost.</p>'
+      + '<p>The Points Market has no confirmed sales tax, so this assumes 0%. Flag it if that&#39;s wrong.</p>'],
+    sets: ['Plushie &amp; Flower Sets', '<p>Is it worth trading a full set in at the Museum for points?</p>'
+      + '<p><b>Cost</b> = one of each set item at your buy price (or the abroad shop price). <b>Payout</b> = set points &times; your points sell price.</p>'
+      + '<p>Also shows how many set items you hold, full sets ready, and what&#39;s still to buy abroad. Hover a row for the breakdown.</p>'],
+    abroad: ['Xanax &amp; abroad stock', '<p>Live abroad shop stock and prices from YATA&#39;s public travel feed, refreshed about every 10 minutes.</p>'
+      + '<p>Green = cheapest country in stock. Dimmed = out of stock.</p>'],
+    instant: ['Instant purchase detection', '<p>Watches the Bazaar, Item Market and Points Market pages and logs a buy the moment it happens.</p>'
+      + '<p>Turn off to rely only on the slower API log check.</p>'],
+    manualscan: ['Manual scan', '<p><b>On</b> (PDA default): no background API polling. Instant detection still catches buys, and <b>Scan now</b> runs a full log check when you want one.</p>'
+      + '<p><b>Off</b> (desktop default): FLIPR also checks your log every few seconds.</p><p>Applies straight away. Each device keeps its own setting.</p>'],
+    markettax: ['After-tax price', '<p>On the Item Market, tap a listing to see its price minus Torn&#39;s 5% sales tax, with a Copy button.</p>'
+      + '<p>Read-only - it never fills or clicks anything.</p>'],
+    quality: ['Quality &amp; bonuses', '<p>Adds a <b>Q %</b> quality badge and bonus percentages to weapons and armour on the Item Market, Bazaar, your Items page, Display Cases and Faction Armory.</p>'
+      + '<p>Reads only what the page shows - no API calls. Steps aside if another quality script already tagged a listing.</p>'],
+    trades: ['Track player trades', '<p>When you open a finished trade&#39;s log, FLIPR records money-for-one-item as a buy (into Holdings) or a sale (into Profits, no tax). Each trade is recorded once.</p>'
+      + '<p>Multi-item or item-for-item trades are skipped - there&#39;s no fair way to split the money. Missed one? Use <b>$</b> on its Holdings row.</p>'],
+    dock: ['Dock button', '<p><b>Off</b> (default): a floating button you drag anywhere.</p>'
+      + '<p><b>On</b>: a fixed <b>F</b> sits next to Notes/People in Torn&#39;s bottom bar - easier on the PDA. The panel works the same either way.</p>'],
+    apikey: ['API key', '<p>Needed to read your buy/sell log. <b>Make a FLIPR-only key</b> opens Torn with just three boxes ticked: user &gt; basic (your player id), user &gt; log (your buys and sells), torn &gt; items (item names).</p>'
+      + '<p>That key can&#39;t see your money, messages or faction. If the boxes aren&#39;t ticked, tick them by hand. The key is only ever sent to Torn&#39;s API.</p>'],
+    cloud: ['Cloud sync', '<p>Optional. Backs up your FLIPR data (holdings, sales, points, settings) to a private copy tied to your Torn ID, so desktop and the Torn PDA stay in sync.</p>'
+      + '<p>Your API key is NEVER uploaded. Scan mode stays per device. Turning this off deletes the backup.</p>'],
+    debug: ['Debug export', '<p>Copies your settings, holdings and log-sync state so the script maintainer can debug a problem. Your API key is never included.</p>'],
+  };
+  const q = (key) => `<span class="flipr-q" data-help="${key}" title="What is this?">?</span>`;
+
   const panel = document.createElement('div');
   panel.id = 'flipr-panel';
   if (settings.collapsed) panel.classList.add('flipr-collapsed');
@@ -2171,19 +2702,33 @@
         <button class="flipr-tab-btn flipr-tab-active" id="flipr-tab-btn-main">Flip</button>
         <button class="flipr-tab-btn" id="flipr-tab-btn-profits">Profits</button>
         <button class="flipr-tab-btn" id="flipr-tab-btn-points">Points</button>
+        <button class="flipr-tab-btn" id="flipr-tab-btn-sets">Sets</button>
         <button class="flipr-tab-btn" id="flipr-tab-btn-settings">\u2699</button>
       </div>
       <div id="flipr-tab-main">
         <div class="flipr-section">
-          <h4>Holdings</h4>
+          <h4>Holdings${q('holdings')}</h4>
           <label class="flipr-checkbox-row">
             <input type="checkbox" id="flipr-holdings-lump">
             Lump same items together (avg price)
           </label>
           <div id="flipr-holdings"></div>
+          <button type="button" id="flipr-add-holding-toggle" class="flipr-btn" style="margin-top:6px;">+ Add a holding by hand</button>
+          <div id="flipr-add-holding" style="display:none; margin-top:6px;">
+            <div class="flipr-row">
+              <input type="text" id="flipr-add-name" placeholder="Item name" list="flipr-add-names" autocomplete="off" />
+              <datalist id="flipr-add-names"></datalist>
+            </div>
+            <div class="flipr-row">
+              <input type="text" id="flipr-add-qty" class="flipr-input-qty" placeholder="Qty" inputmode="decimal" autocomplete="off" />
+              <input type="text" id="flipr-add-price" class="flipr-input-price" placeholder="Paid each (e.g. 15k)" inputmode="decimal" autocomplete="off" />
+              <button type="button" id="flipr-add-holding-btn" class="flipr-btn">Add</button>
+            </div>
+            <div id="flipr-add-holding-msg" class="flipr-hint">For things you bought before FLIPR, or a buy it missed.</div>
+          </div>
         </div>
         <div class="flipr-section">
-          <h4>Sell Check</h4>
+          <h4>Sell Check${q('sellcheck')}</h4>
           <div class="flipr-fee-toggle">
             <label><input type="radio" name="flipr-fee" value="bazaar" /> Bazaar (0%)</label>
             <label><input type="radio" name="flipr-fee" value="standard" /> Market (5%)</label>
@@ -2193,108 +2738,148 @@
             <select id="flipr-check-item"></select>
           </div>
           <div class="flipr-row">
-            <input type="number" id="flipr-check-price" class="flipr-input-price" placeholder="Listing price" min="0" />
-            <input type="number" id="flipr-check-qty" class="flipr-input-qty" placeholder="Qty" min="1" />
+            <input type="text" id="flipr-check-price" class="flipr-input-price" placeholder="Price (e.g. 15k)" inputmode="decimal" autocomplete="off" />
+            <input type="text" id="flipr-check-qty" class="flipr-input-qty" placeholder="Qty" inputmode="decimal" autocomplete="off" />
           </div>
           <div id="flipr-check-result"></div>
         </div>
       </div>
       <div id="flipr-tab-profits" style="display:none;">
         <div class="flipr-section">
-          <h4>Realized Profit</h4>
+          <h4>Realized Profit${q('realized')}</h4>
           <div id="flipr-profits-summary"></div>
-          <div class="flipr-hint">Auto-logged when a listing sells (needs your API key). Profit is proceeds minus what you paid for that item in FLIPR. Items you sold but never bought through FLIPR (crime loot, pre-install stock) count as sold but have no cost basis.</div>
+          <div class="flipr-hint">Sales minus what you paid. Needs your API key.</div>
+        </div>
+        <div class="flipr-section" id="flipr-daily-section" style="display:none;">
+          <h4>Profit by day${q('daily')}</h4>
+          <div id="flipr-daily-list"></div>
+          <div class="flipr-hint">&#x2605; best day &middot; &#x26A0; worst. Hover a day for details.</div>
+        </div>
+        <div class="flipr-section" id="flipr-disposals-section" style="display:none;">
+          <h4>Traded for Points / Used${q('disposals')}</h4>
+          <div id="flipr-disposals-summary" class="flipr-holding-meta"></div>
+          <div id="flipr-disposals-list"></div>
+          <div class="flipr-hint">Used or traded in, not sold. Tap a row to add points.</div>
         </div>
         <div class="flipr-section">
-          <h4>Recent Sales</h4>
+          <h4>Recent Sales${q('recent')}</h4>
           <div id="flipr-sales-list"></div>
         </div>
         <div class="flipr-section">
           <button class="flipr-btn flipr-btn-danger flipr-btn-block" id="flipr-clear-sales-btn">Clear profit history</button>
         </div>
       </div>
+      <div id="flipr-tab-sets" style="display:none;">
+        <div class="flipr-section" id="flipr-setprofit-section">
+          <h4>Plushie &amp; Flower Sets${q('sets')}</h4>
+          <div class="flipr-row">
+            <label for="flipr-setprofit-price" style="flex:1;white-space:nowrap;color:#8a8a8a;">Points sell price</label>
+            <input type="text" id="flipr-setprofit-price" class="flipr-input-price" placeholder="$ each (e.g. 45k)" autocomplete="off" />
+          </div>
+          <div id="flipr-setprofit-list"></div>
+          <div class="flipr-hint">Enter your points price to value each set.</div>
+        </div>
+        <div class="flipr-section" id="flipr-abroad-section" style="display:none;">
+          <h4>Xanax &amp; abroad stock${q('abroad')}</h4>
+          <div id="flipr-abroad-xanax"></div>
+        </div>
+      </div>
       <div id="flipr-tab-points" style="display:none;">
         <div class="flipr-section">
-          <h4>Points Held</h4>
+          <h4>Points Held${q('points')}</h4>
           <div id="flipr-points-summary" class="flipr-holding-meta"></div>
           <div id="flipr-points-lots"></div>
         </div>
         <div class="flipr-section">
-          <h4>Sell Check</h4>
+          <h4>Sell Check${q('pointscheck')}</h4>
           <div class="flipr-row">
             <select id="flipr-points-check-tier"></select>
           </div>
           <div class="flipr-row">
-            <input type="number" id="flipr-points-check-price" class="flipr-input-price" placeholder="Listing price" min="0" />
-            <input type="number" id="flipr-points-check-qty" class="flipr-input-qty" placeholder="Qty" min="1" />
+            <input type="text" id="flipr-points-check-price" class="flipr-input-price" placeholder="Price (e.g. 34k)" inputmode="decimal" autocomplete="off" />
+            <input type="text" id="flipr-points-check-qty" class="flipr-input-qty" placeholder="Qty" inputmode="decimal" autocomplete="off" />
           </div>
-          <div class="flipr-hint">No confirmed Points Market sales tax (unlike Item Market), so this checks raw profit at 0% - flag it if that's wrong.</div>
+          <div class="flipr-hint">Assumes 0% tax.</div>
           <div id="flipr-points-check-result"></div>
         </div>
       </div>
       <div id="flipr-tab-settings" style="display:none;">
         <div class="flipr-section">
           <h4>Purchase detection</h4>
-          <label class="flipr-checkbox-row">
-            <input type="checkbox" id="flipr-scan-page-text" checked>
-            Instant purchase detection
-          </label>
-          <div class="flipr-hint">Logs a buy the second it happens on the Bazaar/Item Market/Points Market pages themselves - turn off to use only the slower, safer API check.</div>
-          <label class="flipr-checkbox-row">
-            <input type="checkbox" id="flipr-manual-scan">
-            Manual scan (scan on a button, not constantly)
-          </label>
-          <div class="flipr-hint">On (default on the Torn PDA): stops the constant background API polling and the scan-on-every-refresh. Buys are still caught instantly on the page as they happen (if the box above is on), and the button below runs a full log check on demand. Off (default on desktop): FLIPR also polls your log every few seconds. Changing this takes effect on the next page load.</div>
+          <div class="flipr-opt">
+            <label class="flipr-checkbox-row">
+              <input type="checkbox" id="flipr-scan-page-text" checked>
+              Instant purchase detection
+            </label>${q('instant')}
+          </div>
+          <div class="flipr-hint">Logs a buy the moment it happens on the page.</div>
+          <div class="flipr-opt">
+            <label class="flipr-checkbox-row">
+              <input type="checkbox" id="flipr-manual-scan">
+              Manual scan
+            </label>${q('manualscan')}
+          </div>
+          <div class="flipr-hint">Check your log on a button instead of constantly.</div>
           <button type="button" id="flipr-scan-now" class="flipr-btn">Scan now</button>
           <div id="flipr-scan-now-status" class="flipr-hint"></div>
         </div>
         <div class="flipr-section">
           <h4>Market tools</h4>
-          <label class="flipr-checkbox-row">
-            <input type="checkbox" id="flipr-market-tax">
-            After-tax price on Item Market click
-          </label>
-          <div class="flipr-hint">On the Item Market, click a listing to see its price minus Torn's 5% sales tax, with a Copy button. Read-only - it never fills or clicks anything for you.</div>
-          <label class="flipr-checkbox-row">
-            <input type="checkbox" id="flipr-market-quality">
-            Show weapon/armour quality and bonuses
-          </label>
-          <div class="flipr-hint">Draws a "Q %" quality badge and the bonus percentages onto each weapon/armour on the Item Market, Bazaar, your Items page, any Display Case and your Faction Armory. Read-only - it reads what the page already shows (and, on the Item Market, the page's own listing data) and adds no API calls. If another quality-overlay script has already tagged a listing, FLIPR steps aside on it.</div>
+          <div class="flipr-opt">
+            <label class="flipr-checkbox-row">
+              <input type="checkbox" id="flipr-market-tax">
+              After-tax price on Item Market click
+            </label>${q('markettax')}
+          </div>
+          <div class="flipr-hint">Tap a listing to see it minus the 5% tax.</div>
+          <div class="flipr-opt">
+            <label class="flipr-checkbox-row">
+              <input type="checkbox" id="flipr-market-quality">
+              Show weapon/armour quality and bonuses
+            </label>${q('quality')}
+          </div>
+          <div class="flipr-hint">Q% badge and bonuses on weapons and armour.</div>
         </div>
         <div class="flipr-section">
           <h4>Player trades</h4>
-          <label class="flipr-checkbox-row">
-            <input type="checkbox" id="flipr-track-trades">
-            Track completed player trades
-          </label>
-          <div class="flipr-hint">When you open a finished trade's log (trade.php), FLIPR reads what changed hands: money for one item = a buy (into Holdings) or a sale (into Profits, no tax). Read-only - it only reads the log page you opened, and each trade is recorded once. Multi-item or item-for-item trades are noted but not auto-priced (no honest way to split one lump of money across different items).</div>
+          <div class="flipr-opt">
+            <label class="flipr-checkbox-row">
+              <input type="checkbox" id="flipr-track-trades">
+              Track completed player trades
+            </label>${q('trades')}
+          </div>
+          <div class="flipr-hint">Logs money-for-item trades as buys or sales.</div>
         </div>
         <div class="flipr-section">
           <h4>Launcher</h4>
-          <label class="flipr-checkbox-row">
-            <input type="checkbox" id="flipr-launcher-dock">
-            Dock button to Torn's bottom bar
-          </label>
-          <div class="flipr-hint">Off (default): a floating button you drag anywhere and tap to open. On: hides that floating button and puts a fixed "F" next to the Notes/People icons in Torn's bottom bar - easier to open and close on the PDA than dragging. The panel still drags and closes the same way once open.</div>
+          <div class="flipr-opt">
+            <label class="flipr-checkbox-row">
+              <input type="checkbox" id="flipr-launcher-dock">
+              Dock button to Torn's bottom bar
+            </label>${q('dock')}
+          </div>
+          <div class="flipr-hint">Puts the F button next to Notes/People.</div>
         </div>
         <div class="flipr-section">
-          <h4>API key</h4>
+          <h4>API key${q('apikey')}</h4>
           <div id="flipr-api-key-section"></div>
           <div id="flipr-log-status" class="flipr-holding-meta"></div>
         </div>
         <div class="flipr-section">
-          <h4>Cloud sync</h4>
-          <div class="flipr-hint">Optional. Backs up your FLIPR data (holdings, sales, points, settings) to a private copy tied to your Torn ID, so your desktop and the Torn PDA stay in sync automatically. Your API key is NEVER uploaded, and the backup is deleted when you turn this off. Off until you turn it on.</div>
-          <label class="flipr-checkbox-row">
-            <input type="checkbox" id="flipr-cloud-sync">
-            Sync my FLIPR data across devices
-          </label>
+          <h4>Cloud sync${q('cloud')}</h4>
+          <div class="flipr-opt">
+            <label class="flipr-checkbox-row">
+              <input type="checkbox" id="flipr-cloud-sync">
+              Sync my FLIPR data across devices
+            </label>
+          </div>
+          <div class="flipr-hint">Optional backup that keeps desktop and PDA in step. Your API key is never uploaded.</div>
           <div id="flipr-cloud-status" class="flipr-holding-meta"></div>
           <button class="flipr-btn flipr-btn-danger" id="flipr-cloud-delete" style="display:none;">Delete my cloud data</button>
         </div>
         <div class="flipr-section">
-          <h4>Debug export</h4>
-          <div class="flipr-hint">Share this with the script maintainer to help debug FLIPR - it includes your settings, holdings, and log-sync state. Your API key is NEVER included.</div>
+          <h4>Debug export${q('debug')}</h4>
+          <div class="flipr-hint">For the script maintainer. Never includes your API key.</div>
           <button class="flipr-btn flipr-btn-block" id="flipr-debug-export-btn">Copy debug export</button>
           <textarea id="flipr-debug-export-area" readonly class="flipr-debug-textarea" style="display:none;"></textarea>
         </div>
@@ -2314,9 +2899,62 @@
   // position:fixed so it lays out identically parented to either one.
   (document.body || document.documentElement).appendChild(panel);
 
+  // Shared "?" help card. Appended to body (not the panel) so it is never clipped by
+  // the panel's scroll box; placed beside the panel when there's room, else centred
+  // (PDA/phone). Chips are a toggle: tap again, tap the x, or tap anywhere else closes.
+  const helpCard = document.createElement('div');
+  helpCard.id = 'flipr-help';
+  (document.body || document.documentElement).appendChild(helpCard);
+  function hideFliprHelp() {
+    helpCard.classList.remove('flipr-open');
+    panel.querySelectorAll('.flipr-q.flipr-q-on').forEach((el) => el.classList.remove('flipr-q-on'));
+  }
+  function placeFliprHelp(chip) {
+    const W = 250, gap = 8, vw = window.innerWidth, vh = window.innerHeight;
+    const pr = panel.getBoundingClientRect();
+    const cr = chip.getBoundingClientRect();
+    const h = helpCard.offsetHeight;
+    let left;
+    if (vw - pr.right >= W + gap * 2) left = pr.right + gap;
+    else if (pr.left >= W + gap * 2) left = pr.left - W - gap;
+    else left = Math.max(gap, (vw - W) / 2);
+    let top = Math.min(Math.max(gap, cr.top - 10), Math.max(gap, vh - h - gap));
+    helpCard.style.left = Math.round(left) + 'px';
+    helpCard.style.top = Math.round(top) + 'px';
+  }
+  function showFliprHelp(key, chip) {
+    const entry = FLIPR_HELP[key];
+    if (!entry) return;
+    const wasOpen = helpCard.classList.contains('flipr-open') && chip.classList.contains('flipr-q-on');
+    hideFliprHelp();
+    if (wasOpen) return;
+    helpCard.innerHTML = `<h4>${entry[0]}<span class="flipr-help-close" title="Close">&times;</span></h4><div>${entry[1]}</div>`;
+    helpCard.classList.add('flipr-open');
+    chip.classList.add('flipr-q-on');
+    placeFliprHelp(chip);
+  }
+  // Capture phase + preventDefault so a chip near a label/button can never also
+  // toggle a checkbox or fire a button (BUSTR v2.11.0 lesson).
+  panel.addEventListener('click', (e) => {
+    const chip = e.target.closest ? e.target.closest('.flipr-q') : null;
+    if (!chip) return;
+    e.preventDefault();
+    e.stopPropagation();
+    showFliprHelp(chip.dataset.help, chip);
+  }, true);
+  helpCard.addEventListener('click', (e) => {
+    if (e.target.closest && e.target.closest('.flipr-help-close')) hideFliprHelp();
+  });
+  document.addEventListener('click', (e) => {
+    if (!helpCard.classList.contains('flipr-open')) return;
+    const t = e.target;
+    if (helpCard.contains(t) || (t.closest && t.closest('.flipr-q'))) return;
+    hideFliprHelp();
+  }, true);
+
   const $ = (sel) => panel.querySelector(sel);
 
-  const FLIPR_TAB_NAMES = ['main', 'profits', 'points', 'settings'];
+  const FLIPR_TAB_NAMES = ['main', 'profits', 'points', 'sets', 'settings'];
   // Persists the choice to settings so a page refresh (which re-runs this
   // whole script from scratch, with no memory of what was open a moment
   // ago) reopens on whichever tab was last active instead of always
@@ -2333,10 +2971,11 @@
   for (const name of FLIPR_TAB_NAMES) {
     $(`#flipr-tab-btn-${name}`).addEventListener('click', () => showFliprTab(name));
   }
-  // Restore whichever tab was open before the last refresh - visibility ONLY. Drawing a
-  // tab this early runs its renderer before state declared further down exists; a throw
-  // here would kill the script before the drag/click handlers below are wired, leaving a
-  // dead button stuck top-right. The init renderAll() after the renderers draws it.
+  // Restore whichever tab was open before the last refresh - visibility ONLY. Drawing it
+  // here ran the tab's renderer before its state further down the script existed (Sets
+  // read `yataStock` in its TDZ), and the throw killed the script before the drag/click
+  // handlers below were wired: a dead button stuck top-right on every load while Sets was
+  // the saved tab. The init renderAll() after the renderers draws it once all state exists.
   showFliprTab(settings.activeTab, true);
 
   ////////////////////////////////////////////////////////////////////////////
@@ -2785,6 +3424,8 @@
     settings.manualScan = e.target.checked;
     saveSettings(settings);
     refreshStatusLine();
+    // Turning manual scan off resumes the auto-poll now, not on next reload.
+    if (!settings.manualScan) startLogPolling();
   });
 
   // One-tap full reconcile for manual-scan mode: fetch the API log now, read the
@@ -2825,6 +3466,79 @@
     if (settings.trackTrades) scanTradeLog(); // re-read the trade currently open, if any
   });
 
+  // Trade-flow probe toggle (read-only diagnostic - see TRADE PROBE).
+  { const tp = $('#flipr-trade-probe'); if (tp) {
+    tp.checked = settings.tradeProbe;
+    tp.addEventListener('change', (e) => {
+      settings.tradeProbe = e.target.checked;
+      saveSettings(settings);
+      if (settings.tradeProbe) { lastProbeSig = ''; tradeProbeTick('toggle-on'); } // capture the current stage now
+      else probeOverlayHide();
+    });
+  } }
+
+  // Add a holding by hand - for stock bought before FLIPR (or with a
+  // key that had no log access), and buys it missed. Same addLot() the detectors
+  // use, so the row merges, edits and sells like any other. The name snaps to
+  // Torn's own spelling when the item catalog knows it, because a sale only finds
+  // its cost when the names match; with a catalog loaded, unknown names are refused.
+  (function initAddHolding() {
+    const toggle = $('#flipr-add-holding-toggle');
+    const box = $('#flipr-add-holding');
+    const nameIn = $('#flipr-add-name');
+    const qtyIn = $('#flipr-add-qty');
+    const priceIn = $('#flipr-add-price');
+    const msg = $('#flipr-add-holding-msg');
+    if (!toggle || !box || !nameIn || !qtyIn || !priceIn || !msg) return;
+    const HINT = 'For things you bought before FLIPR, or a buy it missed.';
+    const catalogNames = () => [...new Set(Object.values((itemCatalog && itemCatalog.names) || {}).filter((n) => typeof n === 'string'))];
+    toggle.addEventListener('click', () => {
+      const open = box.style.display === 'none';
+      box.style.display = open ? '' : 'none';
+      toggle.textContent = open ? '− Close' : '+ Add a holding by hand';
+      if (open) {
+        const dl = $('#flipr-add-names');
+        if (dl && !dl.childElementCount) {
+          const frag = document.createDocumentFragment();
+          for (const n of catalogNames().sort()) { const o = document.createElement('option'); o.value = n; frag.appendChild(o); }
+          dl.appendChild(frag);
+        }
+        msg.textContent = HINT;
+        nameIn.focus();
+      }
+    });
+    const submit = () => {
+      const raw = String(nameIn.value || '').trim();
+      const qty = parseMoneyInput(qtyIn.value);
+      const unit = parseMoneyInput(priceIn.value);
+      if (!raw) { msg.textContent = 'Type the item name.'; nameIn.focus(); return; }
+      if (!(Number.isInteger(qty) && qty > 0)) { msg.textContent = 'Qty must be a whole number above 0.'; qtyIn.focus(); return; }
+      if (!(Number.isFinite(unit) && unit >= 0)) { msg.textContent = 'Type what you paid each, e.g. 15k or 1.5m.'; priceIn.focus(); return; }
+      const names = catalogNames();
+      let name = raw;
+      if (names.length) {
+        const hit = names.find((n) => normalize(n) === normalize(raw));
+        if (!hit) { msg.textContent = `"${raw}" isn't a Torn item name - pick it from the list.`; nameIn.focus(); return; }
+        name = hit;
+      }
+      const lotsBackup = JSON.parse(JSON.stringify(lots));
+      const lot = addLot(name, qty, Math.round(unit), 'manual-add', null, null);
+      if (!lot) { msg.textContent = 'Could not add that - check the values.'; return; }
+      nameIn.value = ''; qtyIn.value = ''; priceIn.value = '';
+      msg.textContent = HINT;
+      renderAll();
+      showToast(`Added ${name} ×${qty} at ${money(Math.round(unit))} each.`, () => {
+        lots = lotsBackup; saveLots(lots);
+        renderAll();
+      });
+    };
+    const btn = $('#flipr-add-holding-btn');
+    if (btn) btn.addEventListener('click', submit);
+    for (const el of [nameIn, qtyIn, priceIn]) {
+      el.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    }
+  })();
+
   $('#flipr-holdings-lump').checked = settings.holdingsMode === 'lump';
   $('#flipr-holdings-lump').addEventListener('change', (e) => {
     settings.holdingsMode = e.target.checked ? 'lump' : 'separate';
@@ -2853,7 +3567,9 @@
     const itemCount = openLots.length;
     const hasKey = !!getApiKey();
     let syncLabel;
-    if (settings.scanPageText && hasKey) syncLabel = 'instant + API sync on';
+    // manual-scan mode: the API log is only checked on "Scan now", so say so.
+    if (settings.manualScan && hasKey) syncLabel = (settings.scanPageText ? 'instant' : 'instant detection OFF') + ' · API on "Scan now" only';
+    else if (settings.scanPageText && hasKey) syncLabel = 'instant + API sync on';
     else if (settings.scanPageText) syncLabel = 'instant detection only';
     else if (hasKey) syncLabel = 'instant detection OFF \u00B7 API sync only';
     else syncLabel = 'instant detection OFF \u00B7 no API key - nothing will log';
@@ -2936,11 +3652,7 @@
       keyLink.style.color = 'var(--flipr-link, #4da3ff)';
       keyHint.appendChild(keyLink);
       keyHint.appendChild(document.createTextNode(
-        ' - opens Torn with just the three boxes FLIPR needs already ticked: '
-        + 'user > basic (your player id, so cloud sync can confirm the key is yours), '
-        + 'user > log (your own buys and sells) and torn > items (item names). '
-        + 'If it opens without them ticked, tick those three by hand. A Full key works '
-        + 'too, but gives away far more than this script ever reads.'
+        ' - only the 3 boxes FLIPR needs come pre-ticked (tap ? above for details).'
       ));
       container.appendChild(keyHint);
 
@@ -3041,7 +3753,36 @@
       // skipped) their title/category so a miss can be root-caused directly
       // from this export.
       lastPollDebug,
-      itemCatalog: { fetchedAt: itemCatalog.fetchedAt, cachedItemCount: Object.keys(itemCatalog.names).length },
+      // why the auto-poll might not be running.
+      pollState: { manualScan: !!settings.manualScan, scanPageText: !!settings.scanPageText, timerStarted: logPollTimerStarted, inFlight: logPollInFlight, fatalKeyError: logPollFatalError, cloudOn: !!(CloudSync.enabled() && CloudSync.signedIn()) },
+      itemCatalog: {
+        fetchedAt: itemCatalog.fetchedAt,
+        cachedItemCount: Object.keys(itemCatalog.names).length,
+        // how many items carry type+abroad-price meta (0 = a pre-meta cache
+        // that ensureItemCatalog hasn't refetched yet - the Set exchange tool stays hidden).
+        metaCount: Object.keys(itemCatalog.meta || {}).length,
+      },
+      // Set exchange value readout, so a debug export shows exactly what the
+      // tool priced each set at (members, your/Torn/no-price split, cost, payout, profit).
+      setExchange: (function () {
+        try {
+          const price = Number(settings.pointsSellPrice) || 0;
+          const out = { pointsSellPrice: price, sets: {} };
+          for (const name of ['Plushie Set', 'Flower Set']) {
+            const members = catalogSetMembers(name);
+            const r = computeSetProfit(name, price);
+            out.sets[name] = {
+              memberCount: r.memberCount, pricedMine: r.pricedMine, pricedTorn: r.pricedTorn,
+              missingCount: r.missing.length, missing: r.missing.slice(0, 20),
+              setCost: r.setCost, payout: r.payout, payoutEst: r.payoutEst,
+              proceeds: r.proceeds, profit: r.profit,
+              // Per-member abroad buy price (catalog), to spot a rogue price fast.
+              members: members.map((m) => ({ name: m.name, buy: m.buy })),
+            };
+          }
+          return out;
+        } catch (e) { return { error: String(e) }; }
+      })(),
       settings: {
         feeMode: settings.feeMode,
         feeValue: currentFee(),
@@ -3051,12 +3792,24 @@
         marketTaxHelper: settings.marketTaxHelper,
         marketQuality: settings.marketQuality,
         trackTrades: settings.trackTrades,
+        tradeProbe: settings.tradeProbe,
         activeTab: settings.activeTab,
         // Read alongside platform.viewport above: a panel reported as missing or
         // half off-screen is usually a saved spot that no longer fits the screen.
         panelPos: settings.panelPos,
         collapsedPos: settings.collapsedPos,
       },
+      // Read-only trade-probe lifecycle log (see TRADE PROBE).
+      tradeProbeLog,
+      // Raw Museum-exchange / player-trade log entries (type id + data
+      // shape) captured from the API log, to build auto-detection of plushies/
+      // flowers -> points and completed trades. See captureLogShape.
+      tradeMuseumLogShapes: logShapeSamples,
+      // The disposals ledger ("Traded for Points / Used"), so a museum
+      // auto-detect (or a manual disposal) is verifiable straight from an export.
+      // Each `museum` record carries the set name, qty consumed, points, and snapshot
+      // lots for undo; `auto:true` marks the ones the museum poll created.
+      disposals: { count: disposals.length, records: disposals },
       holdings: getHoldings(),
       // Each lot's `source` is either 'dom-text' (instant on-page confirmation
       // read) or 'api-log:<entryId>' (API poll fallback).
@@ -3066,6 +3819,9 @@
       // rows are currently retained (capped at RECENT_SALES_MAX). No per-sale rows
       // are dumped here - the totals are what diagnose a wrong profit number.
       sales: { totals: salesData.totals, recentCount: salesData.recent.length },
+      // Permanent per-day profit ledger (YYYY-MM-DD -> {profit,proceeds,
+      // cost,fee,count}). Small (one entry per active day) and verifies the daily view.
+      salesDaily: salesData.daily || {},
       // The last 30 sale records in full. Needed to diagnose a wrong profit figure:
       // proceeds/matchedQty/matchedCost/profit together show whether the fault was the
       // proceeds read, the basis match, or the same sale being recorded twice.
@@ -3209,6 +3965,27 @@
           : 'Click to edit the price you paid';
         metaSpan.addEventListener('click', () => startPriceEdit(metaSpan, entry));
 
+        // Record a manual sale - the safety net for when auto-detect misses a
+        // trade. Opens an inline sell-price box in the price cell (see startSellEntry).
+        const sellBtn = document.createElement('button');
+        sellBtn.className = 'flipr-x';
+        sellBtn.textContent = '$';
+        sellBtn.title = 'Sold this? Record the sale by hand (for trades the script did not catch)';
+        sellBtn.addEventListener('click', () => startSellEntry(metaSpan, entry));
+
+        // "Traded in for points / used" - move this holding into the
+        // disposals ledger so it stops showing as never-sold. Read-only bookkeeping.
+        const ptsBtn = document.createElement('button');
+        ptsBtn.className = 'flipr-x';
+        ptsBtn.textContent = '\u21c4'; // exchange arrows - "traded in", not sold
+        ptsBtn.title = entry.isLump
+          ? 'Move ALL of this item out of Holdings - traded in for points / used (not a market sale)'
+          : 'Move this out of Holdings - traded in for points / used (not a market sale)';
+        ptsBtn.addEventListener('click', () => {
+          recordDisposal(entry.id, 'points');
+          renderAll();
+        });
+
         const delBtn = document.createElement('button');
         delBtn.className = 'flipr-x';
         delBtn.textContent = '\u2715';
@@ -3220,6 +3997,8 @@
 
         row.appendChild(nameSpan);
         row.appendChild(metaSpan);
+        row.appendChild(sellBtn);
+        row.appendChild(ptsBtn);
         row.appendChild(delBtn);
         container.appendChild(row);
       }
@@ -3318,10 +4097,11 @@
     const resultBox = $('#flipr-points-check-result');
     if (!resultBox) return;
     const entry = findPointsLotByUnitCost($('#flipr-points-check-tier').value);
-    const price = Number($('#flipr-points-check-price').value);
-    const qty = Number($('#flipr-points-check-qty').value) || 1;
+    // Text inputs + parseMoneyInput so "34k" / "1.5m" work (type=number rejected them).
+    const price = parseMoneyInput($('#flipr-points-check-price').value);
+    const qty = Math.floor(parseMoneyInput($('#flipr-points-check-qty').value)) || 1;
     resultBox.innerHTML = '';
-    if (!entry || !(price >= 0) || !$('#flipr-points-check-price').value) return;
+    if (!entry || !(price >= 0)) return;
 
     const profit = profitTotal(price, entry.unitCost, 0, qty);
     const isProfit = profit >= 0;
@@ -3330,7 +4110,7 @@
     box.className = 'flipr-result ' + (isProfit ? 'flipr-profit' : 'flipr-loss');
     const verdict = document.createElement('div');
     verdict.className = 'flipr-verdict';
-    verdict.textContent = `${isProfit ? 'PROFIT' : 'LOSS'} of ${money(Math.abs(profit))} (${pct((profit / (entry.unitCost * qty)) * 100)})`;
+    verdict.textContent = `${isProfit ? 'PROFIT' : 'LOSS'} of ${money(Math.abs(profit))}${pctOfCost(profit, entry.unitCost * qty)}`;
     const detail = document.createElement('div');
     detail.textContent = `Cost ${money(entry.unitCost)}/pt \u00B7 sell ${money(price)}/pt`;
     box.appendChild(verdict);
@@ -3366,10 +4146,11 @@
   function renderSellCheckResult() {
     const resultBox = $('#flipr-check-result');
     const entry = findEntryById($('#flipr-check-item').value);
-    const price = Number($('#flipr-check-price').value);
-    const qty = Number($('#flipr-check-qty').value) || 1;
+    // Text inputs + parseMoneyInput so "15k" / "1.5m" work (type=number rejected them).
+    const price = parseMoneyInput($('#flipr-check-price').value);
+    const qty = Math.floor(parseMoneyInput($('#flipr-check-qty').value)) || 1;
     resultBox.innerHTML = '';
-    if (!entry || !(price >= 0) || !$('#flipr-check-price').value) return;
+    if (!entry || !(price >= 0)) return;
 
     const fee = currentFee();
     const net = netProceedsPerUnit(price, fee);
@@ -3381,7 +4162,7 @@
     box.className = 'flipr-result ' + (isProfit ? 'flipr-profit' : 'flipr-loss');
     const verdict = document.createElement('div');
     verdict.className = 'flipr-verdict';
-    verdict.textContent = `${isProfit ? 'PROFIT' : 'LOSS'} of ${money(Math.abs(profit))} (${pct((profit / (entry.unitCost * qty)) * 100)})`;
+    verdict.textContent = `${isProfit ? 'PROFIT' : 'LOSS'} of ${money(Math.abs(profit))}${pctOfCost(profit, entry.unitCost * qty)}`;
     const detail = document.createElement('div');
     detail.textContent = `Cost ${money(entry.unitCost)}/unit \u00B7 net ${money(net)}/unit after fee \u00B7 breakeven ${money(be)}`;
     box.appendChild(verdict);
@@ -3399,20 +4180,17 @@
 
   // Scrolling over the closed dropdown cycles the selection like a spinner,
   // so picking a lot out of a long holdings list doesn't require opening it.
-  $('#flipr-check-item').addEventListener(
-    'wheel',
-    (e) => {
-      const select = e.currentTarget;
-      if (select.disabled || select.options.length < 2) return;
-      e.preventDefault();
-      const dir = e.deltaY > 0 ? 1 : -1;
-      const next = select.selectedIndex + dir;
-      if (next < 0 || next >= select.options.length) return;
-      select.selectedIndex = next;
-      select.dispatchEvent(new Event('change'));
-    },
-    { passive: false }
-  );
+  function wheelCycleSelect(e) {
+    const select = e.currentTarget;
+    if (select.disabled || select.options.length < 2) return;
+    e.preventDefault();
+    const dir = e.deltaY > 0 ? 1 : -1;
+    const next = select.selectedIndex + dir;
+    if (next < 0 || next >= select.options.length) return;
+    select.selectedIndex = next;
+    select.dispatchEvent(new Event('change'));
+  }
+  $('#flipr-check-item').addEventListener('wheel', wheelCycleSelect, { passive: false });
 
   $('#flipr-points-check-tier').addEventListener('change', () => {
     const entry = findPointsLotByUnitCost($('#flipr-points-check-tier').value);
@@ -3421,20 +4199,7 @@
   });
   $('#flipr-points-check-price').addEventListener('input', renderPointsCheckResult);
   $('#flipr-points-check-qty').addEventListener('input', renderPointsCheckResult);
-  $('#flipr-points-check-tier').addEventListener(
-    'wheel',
-    (e) => {
-      const select = e.currentTarget;
-      if (select.disabled || select.options.length < 2) return;
-      e.preventDefault();
-      const dir = e.deltaY > 0 ? 1 : -1;
-      const next = select.selectedIndex + dir;
-      if (next < 0 || next >= select.options.length) return;
-      select.selectedIndex = next;
-      select.dispatchEvent(new Event('change'));
-    },
-    { passive: false }
-  );
+  $('#flipr-points-check-tier').addEventListener('wheel', wheelCycleSelect, { passive: false });
 
   $('#flipr-reset-btn').addEventListener('click', () => {
     const cloudOn = CloudSync.enabled() && CloudSync.signedIn();
@@ -3446,6 +4211,10 @@
     Store.del(STORAGE_KEY); // loadLots() already defaults to [] when the key is absent, same end state as saving '[]'
     resetPointsStats();
     clearSalesHistory();
+    // The "Traded for Points / Used" ledger is history too, and its records point
+    // at lots that no longer exist after this - clear it with everything else.
+    disposals = [];
+    Store.del(DISPOSALS_KEY);
     // Clear the durable dedup ledgers too, so a reset genuinely starts clean.
     // Safe because the log watermark (logState.lastTimestamp) is left intact, so
     // resetting does not re-import old purchases the ledger was suppressing.
@@ -3487,6 +4256,8 @@
     if (mq) mq.checked = settings.marketQuality;
     const tt = $('#flipr-track-trades');
     if (tt) tt.checked = settings.trackTrades;
+    const tp = $('#flipr-trade-probe');
+    if (tp) tp.checked = settings.tradeProbe;
     const dock = $('#flipr-launcher-dock');
     if (dock) dock.checked = settings.launcherMode === 'docked';
   }
@@ -3494,7 +4265,521 @@
   // Realized-profit view: a summary block (the numbers RiotFrog asked for) plus a
   // capped list of recent sales. Reads salesData only - never recomputes from lots,
   // since each sale's profit was frozen at detection time (see recordSale).
+  // Off-market disposals list on the Profits tab. Hidden when empty.
+  function renderDisposals() {
+    const section = $('#flipr-disposals-section');
+    const summaryEl = $('#flipr-disposals-summary');
+    const listEl = $('#flipr-disposals-list');
+    if (!section || !summaryEl || !listEl) return;
+    if (!disposals.length) {
+      section.style.display = 'none';
+      summaryEl.textContent = '';
+      listEl.innerHTML = '';
+      return;
+    }
+    section.style.display = '';
+    const totalQty = disposals.reduce((s, d) => s + (Number(d.qty) || 0), 0);
+    const totalCost = disposals.reduce((s, d) => s + (Number(d.cost) || 0), 0);
+    const totalPoints = disposals.reduce((s, d) => s + (Number(d.pointsValue) || 0), 0);
+    summaryEl.textContent = totalPoints > 0
+      ? `${totalQty} item(s) · cost ${money(totalCost)} · ${totalPoints} points received`
+      : `${totalQty} item(s) · cost ${money(totalCost)}`;
+
+    listEl.innerHTML = '';
+    for (const d of [...disposals].sort((a, b) => b.ts - a.ts)) {
+      const row = document.createElement('div');
+      row.className = 'flipr-holding';
+
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'flipr-holding-name';
+      // A museum record names the SET in d.itemName (e.g. "Plushie Set"), but the
+      // items that actually left Holdings live in d.lots - surface them so the row
+      // says what was consumed, e.g. "Plushie Set — Lion Plushie ×1". Manual
+      // disposals keep the plain "Item ×qty" form (their lots ARE that item).
+      if (d.kind === 'museum' && Array.isArray(d.lots) && d.lots.length) {
+        const byItem = new Map();
+        for (const l of d.lots) {
+          const nm = String(l.itemName || '').trim() || 'item';
+          byItem.set(nm, (byItem.get(nm) || 0) + (Number(l.qty) || 0));
+        }
+        const parts = [...byItem.entries()].map(([nm, q]) => `${nm} ×${q}`);
+        nameSpan.textContent = `${d.itemName} — ${parts.join(', ')}`;
+      } else {
+        nameSpan.textContent = `${d.itemName} ×${d.qty}`;
+      }
+      const pts = Number(d.pointsValue) || 0;
+      const basisMoved = d.pointsAdded
+        ? (Number(d.pointsAdded.qty) || 0) * (Number(d.pointsAdded.unitCost) || 0)
+        : 0;
+      nameSpan.title = d.pointsAdded
+        ? `Exchanged on ${new Date(d.ts).toLocaleString()}.\n`
+          + `${money(basisMoved)} item cost moved onto ${pts} points in the Points tab - sell them there to see the profit/loss.`
+        : `Traded in for points / used on ${new Date(d.ts).toLocaleString()}.\n`
+          + `Cost ${money(d.cost)}, kept on record but not counted as a market sale.`;
+
+      const metaSpan = document.createElement('span');
+      metaSpan.className = 'flipr-holding-meta';
+      if (d.pointsAdded) {
+        // Converted to Points-tab holdings: the item cost moved onto those points, so
+        // this row carries no cost here and all P&L for them lives on the Points tab.
+        // Not click-to-edit - the points count is fixed by the exchange and tied to the
+        // lot we created, so letting it be re-typed here would desync the two tabs.
+        metaSpan.textContent = `→ ${pts} pts · cost moved to Points tab`;
+        metaSpan.title = `${money(basisMoved)} cost basis is now on ${pts} points in the Points tab. Sell those points there to see the profit/loss.`;
+      } else {
+        metaSpan.style.cursor = 'pointer';
+        metaSpan.textContent = pts > 0 ? `cost ${money(d.cost)} · ${pts} pts` : `cost ${money(d.cost)} · + points`;
+        metaSpan.title = 'Click to note how many points you received (optional).';
+        metaSpan.addEventListener('click', () => startDisposalPointsEdit(metaSpan, d));
+      }
+
+      const delBtn = document.createElement('button');
+      delBtn.className = 'flipr-x';
+      delBtn.textContent = '✕';
+      delBtn.title = 'Undo - put this back into Holdings exactly as it was';
+      delBtn.addEventListener('click', () => { removeDisposal(d.id); renderAll(); });
+
+      row.appendChild(nameSpan);
+      row.appendChild(metaSpan);
+      row.appendChild(delBtn);
+      listEl.appendChild(row);
+    }
+  }
+
+  // Same inline-edit dance as startPriceEdit, for the optional "points received" figure.
+  function startDisposalPointsEdit(metaSpan, d) {
+    startInlineEdit(metaSpan, {
+      value: (Number(d.pointsValue) || 0) ? String(Number(d.pointsValue)) : '',
+      title: 'Points received - Enter to save, Escape to cancel',
+    }, (val) => {
+      const v = parseMoneyInput(val);
+      setDisposalPoints(d.id, Number.isFinite(v) ? v : 0);
+    }, renderDisposals);
+  }
+
+  // SET EXCHANGE VALUE -------------------------------------------------
+  // "Is it worth assembling a full plushie/flower set and exchanging it at the museum
+  // for points to sell?" Cost = one of every set member at ABROAD price (the user's own
+  // recorded buy where held, else Torn's foreign-shop buy_price), NOT the Item Market.
+  // Proceeds = the set's point reward x a hand-entered points sell price. The reward is
+  // learned from the user's last real museum exchange (default 10 until one is seen).
+
+  // The catalog items that make up a museum set, matched the SAME way the auto-detect
+  // decides what a set consumed (museumSetMatcher) - so the value tool and the auto-mover
+  // always agree on membership. Deliberately NOT "every item of type Flower/Plushie":
+  // raw type pulls in rare, market-only flowers whose buy_price is in the hundreds of
+  // millions (the $950M Flower Set bug) - items you never buy at a country shop, so they
+  // don't belong in the "bought abroad from each country" basis the user wants priced.
+  function catalogSetMembers(setName) {
+    const matcher = museumSetMatcher(setName);
+    if (!matcher) return [];
+    const meta = itemCatalog.meta || {};
+    const names = itemCatalog.names || {};
+    const out = [];
+    for (const [id, nm] of Object.entries(names)) {
+      if (typeof nm === 'string' && matcher(nm)) {
+        out.push({ id, name: nm, buy: Number((meta[id] || {}).buy) || 0 });
+      }
+    }
+    return out;
+  }
+
+  // The point reward for a set, taken from the most recent real museum exchange of that
+  // set (its pointsValue), or null if none seen yet.
+  function learnedSetPayout(setName) {
+    const key = normalize(setName);
+    let best = null, bestTs = -1;
+    for (const d of disposals) {
+      if (d.kind !== 'museum' || normalize(d.itemName) !== key) continue;
+      const ts = Number(d.ts) || 0;
+      // Per SET: a multi-set exchange's pointsValue is the total. Records from before
+      // `sets` was stored count as 1 set (their old behaviour).
+      const pts = (Number(d.pointsValue) || 0) / Math.max(1, Number(d.sets) || 1);
+      if (pts > 0 && ts >= bestTs) { bestTs = ts; best = pts; }
+    }
+    return best;
+  }
+
+  // Abroad foreign-shop stock from YATA's public travel feed
+  // (https://yata.yt/api/v1/travel/export/). No API key - the same public feed TornTools
+  // and Torn Oracle read; we do NOT touch Oracle's own token-gated server or its GPL code.
+  // One cached GET (~10 min TTL) gives, per country, live stock + shop price for every
+  // foreign-shop item - exactly the plushies, flowers and Xanax a trader buys abroad.
+  // Used to (a) show where to buy each set member you still need and whether it's in stock,
+  // (b) fill a set member's abroad price when Torn's item catalog hasn't cached a buy_price
+  // yet, and (c) list Xanax's live per-country price/stock. Public/no-key, so it stays in
+  // the safe channel (no weav3r, no per-player calls). cloudRequest handles the transport
+  // split (GM_xmlhttpRequest on desktop to dodge torn.com's CSP, PDA bridge on the app).
+  const YATA_TRAVEL_URL = 'https://yata.yt/api/v1/travel/export/';
+  const YATA_MAX_AGE_MS = 10 * 60 * 1000;
+  const YATA_COUNTRY = {
+    mex: 'Mexico', cay: 'Cayman', can: 'Canada', haw: 'Hawaii', uni: 'UK',
+    arg: 'Argentina', swi: 'Switzerland', jap: 'Japan', chi: 'China', uae: 'UAE', sou: 'S. Africa',
+  };
+  let yataStock = { fetchedAt: 0, byName: {}, xanax: [] };
+  let yataInflight = null;
+  function ensureYataStock() {
+    if (Date.now() - yataStock.fetchedAt < YATA_MAX_AGE_MS && Object.keys(yataStock.byName).length) {
+      return Promise.resolve(yataStock);
+    }
+    if (yataInflight) return yataInflight;
+    yataInflight = (async () => {
+      try {
+        const res = await cloudRequest('GET', YATA_TRAVEL_URL, {}, null);
+        if (!res || res.status < 200 || res.status >= 300) return yataStock;
+        const j = JSON.parse(res.text);
+        const stocks = (j && j.stocks) || {};
+        const byName = {};
+        const xanax = [];
+        const xk = normalize('Xanax');
+        for (const [cc, c] of Object.entries(stocks)) {
+          const list = (c && c.stocks) || [];
+          for (const it of list) {
+            if (!it || typeof it.name !== 'string') continue;
+            const rec = { cc, country: YATA_COUNTRY[cc] || cc, qty: Number(it.quantity) || 0, cost: Number(it.cost) || 0 };
+            const k = normalize(it.name);
+            (byName[k] = byName[k] || []).push(rec);
+            if (k === xk) xanax.push(rec);
+          }
+        }
+        if (Object.keys(byName).length) {
+          xanax.sort((a, b) => a.cost - b.cost);
+          yataStock = { fetchedAt: Date.now(), byName, xanax };
+        }
+        return yataStock;
+      } catch (e) {
+        log('YATA travel fetch failed', e);
+        return yataStock;
+      } finally {
+        yataInflight = null;
+      }
+    })();
+    return yataInflight;
+  }
+  function yataEntries(name) { return yataStock.byName[normalize(name)] || []; }
+  // Cheapest shop price for an item regardless of stock - the "abroad price" to cost a set.
+  function yataCheapestCost(name) {
+    let best = 0;
+    for (const e of yataEntries(name)) if (e.cost > 0 && (best === 0 || e.cost < best)) best = e.cost;
+    return best;
+  }
+  // Where to actually buy one now: cheapest country that has it IN stock, else cheapest at all.
+  function yataBestSource(name) {
+    const es = yataEntries(name);
+    if (!es.length) return null;
+    const inStock = es.filter((e) => e.qty > 0).sort((a, b) => a.cost - b.cost);
+    if (inStock.length) return inStock[0];
+    return es.slice().sort((a, b) => a.cost - b.cost)[0];
+  }
+  // Xanax's live per-country price + stock (its own block in the Sets tab).
+  function renderAbroad() {
+    const section = $('#flipr-abroad-section');
+    const xl = $('#flipr-abroad-xanax');
+    if (!section || !xl) return;
+    const xs = (yataStock.xanax || []).slice().sort((a, b) => a.cost - b.cost);
+    if (!xs.length) { section.style.display = 'none'; xl.innerHTML = ''; return; }
+    section.style.display = '';
+    xl.innerHTML = '';
+    const head = document.createElement('div');
+    head.className = 'flipr-holding';
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'flipr-holding-name';
+    nameSpan.textContent = 'Xanax';
+    const valSpan = document.createElement('span');
+    valSpan.className = 'flipr-holding-meta';
+    const cheapestInStock = xs.find((e) => e.qty > 0);
+    if (cheapestInStock) {
+      valSpan.style.color = 'var(--flipr-pos, #6c6)';
+      valSpan.textContent = `${cheapestInStock.country} ${money(cheapestInStock.cost)}`;
+      valSpan.title = 'Cheapest country with Xanax in stock right now.';
+    } else {
+      valSpan.style.color = 'var(--flipr-neg, #e66)';
+      valSpan.textContent = 'none in stock';
+      valSpan.title = 'No country currently has Xanax in stock.';
+    }
+    head.appendChild(nameSpan);
+    head.appendChild(valSpan);
+    xl.appendChild(head);
+    for (const e of xs) {
+      const d = document.createElement('div');
+      d.className = 'flipr-holding-meta';
+      if (e.qty > 0) {
+        d.textContent = `${e.country} — ${e.qty.toLocaleString('en-US')} in stock @ ${money(e.cost)}`;
+      } else {
+        d.textContent = `${e.country} — out of stock @ ${money(e.cost)}`;
+        d.style.opacity = '0.6';
+      }
+      xl.appendChild(d);
+    }
+  }
+
+  function computeSetProfit(setName, pointsPrice) {
+    const members = catalogSetMembers(setName);
+    const heldByName = new Map();
+    for (const h of getHoldings()) heldByName.set(normalize(h.itemName), h.avgCost);
+    let setCost = 0, pricedMine = 0, pricedTorn = 0;
+    const missing = [];
+    for (const m of members) {
+      const mine = heldByName.get(normalize(m.name));
+      if (Number.isFinite(mine) && mine > 0) { setCost += mine; pricedMine++; }
+      else if (m.buy > 0) { setCost += m.buy; pricedTorn++; }
+      else {
+        // Catalog has no cached buy_price yet - fall back to YATA's live shop price.
+        const yc = yataCheapestCost(m.name);
+        if (yc > 0) { setCost += yc; pricedTorn++; }
+        else missing.push(m.name);
+      }
+    }
+    const learned = learnedSetPayout(setName);
+    const payout = learned != null ? learned : 10;
+    const proceeds = payout * (Number(pointsPrice) || 0);
+    return {
+      memberCount: members.length, pricedMine, pricedTorn, missing,
+      setCost, payout, payoutEst: learned == null, proceeds, profit: proceeds - setCost,
+    };
+  }
+
+  // Live set-assembly tracker. Unlike computeSetProfit (which prices a
+  // HYPOTHETICAL one-of-each set to answer "is it worth it?"), this reports what you have
+  // ACTUALLY bought toward the set so far, read straight from Holdings (so it updates the
+  // moment an abroad buy lands): how many distinct members you hold, how many COMPLETE
+  // sets that makes (one of every member - the museum auto-detect consumes one of each
+  // held member per set, so this is exactly how many it could convert), the real money
+  // tied up in those members, a per-member qty/spend breakdown, and which members you
+  // still hold none of. Pure derivation - no parallel ledger to drift from Holdings.
+  function computeSetAssembly(setName) {
+    const members = catalogSetMembers(setName);
+    const holdByName = new Map();
+    for (const h of getHoldings()) holdByName.set(normalize(h.itemName), h);
+    let membersHeld = 0;
+    let spentHeld = 0;
+    let completeSets = members.length ? Infinity : 0;
+    const held = [];
+    const need = [];
+    for (const m of members) {
+      const h = holdByName.get(normalize(m.name));
+      const q = h ? (Number(h.qty) || 0) : 0;
+      if (q > 0) {
+        membersHeld++;
+        const spent = Number(h.totalCost) || 0;
+        spentHeld += spent;
+        held.push({ name: m.name, qty: q, spent });
+      } else {
+        need.push(m.name);
+      }
+      completeSets = Math.min(completeSets, q);
+    }
+    if (!Number.isFinite(completeSets)) completeSets = 0;
+    return { memberCount: members.length, membersHeld, completeSets, spentHeld, held, need };
+  }
+
+  function renderSetProfit() {
+    const section = $('#flipr-setprofit-section');
+    const listEl = $('#flipr-setprofit-list');
+    const priceInput = $('#flipr-setprofit-price');
+    if (!section || !listEl) return;
+
+    // Refresh YATA abroad stock (no key, ~10 min cache). Re-render once new data lands so
+    // the Xanax block and per-member "buy abroad" lines fill in. The age gate + in-flight
+    // guard mean a fresh cache returns instantly, so the re-render can't loop.
+    const beforeYataTs = yataStock.fetchedAt;
+    ensureYataStock().then((ys) => { if (ys && ys.fetchedAt !== beforeYataTs) renderSetProfit(); });
+    renderAbroad();
+
+    const SETS = [{ name: 'Plushie Set' }, { name: 'Flower Set' }];
+    // Hidden until the catalog has loaded its members - no point showing empty sets.
+    if (!SETS.some((s) => catalogSetMembers(s.name).length > 0)) {
+      section.style.display = 'none';
+      return;
+    }
+    section.style.display = '';
+
+    const writePrice = () => {
+      if (priceInput && document.activeElement !== priceInput) {
+        const p = Number(settings.pointsSellPrice) || 0;
+        priceInput.value = p ? String(p) : '';
+      }
+    };
+    if (priceInput && priceInput.dataset.bound !== '1') {
+      priceInput.dataset.bound = '1';
+      const commit = () => {
+        const v = parseMoneyInput(priceInput.value);
+        settings.pointsSellPrice = Number.isFinite(v) ? Math.max(0, v) : 0;
+        saveSettings(settings);
+        renderSetProfit();
+      };
+      priceInput.addEventListener('change', commit);
+      priceInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); priceInput.blur(); } });
+    }
+    writePrice();
+
+    const pointsPrice = Number(settings.pointsSellPrice) || 0;
+    listEl.innerHTML = '';
+    for (const s of SETS) {
+      const r = computeSetProfit(s.name, pointsPrice);
+      if (!r.memberCount) continue;
+      const asm = computeSetAssembly(s.name);
+
+      const head = document.createElement('div');
+      head.className = 'flipr-holding';
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'flipr-holding-name';
+      nameSpan.textContent = s.name;
+      const valSpan = document.createElement('span');
+      valSpan.className = 'flipr-holding-meta';
+      if (pointsPrice > 0) {
+        valSpan.style.color = r.profit >= 0 ? 'var(--flipr-pos, #6c6)' : 'var(--flipr-neg, #e66)';
+        // Unknown member prices make the cost a lower bound, so the profit is an UPPER bound (<=).
+        valSpan.textContent = `${r.missing.length ? '\u2264' : ''}${r.profit >= 0 ? '+' : ''}${money(r.profit)}`;
+        valSpan.title = r.missing.length
+          ? 'Net profit of a full-set exchange. Some member prices are unknown, so the real cost is higher and this is an upper bound.'
+          : 'Net profit of a full-set exchange: points proceeds minus the abroad cost of one of every member.';
+      } else {
+        valSpan.textContent = 'enter price';
+        valSpan.title = 'Enter a points sell price above to value a full-set exchange.';
+      }
+      head.appendChild(nameSpan);
+      head.appendChild(valSpan);
+      listEl.appendChild(head);
+
+      const addMeta = (text, title) => {
+        const d = document.createElement('div');
+        d.className = 'flipr-holding-meta';
+        d.textContent = text;
+        if (title) d.title = title;
+        listEl.appendChild(d);
+      };
+
+      // One assembly line — what you've actually bought. Per-member detail and the
+      // still-to-buy list live in the tooltip so the panel stays short.
+      const heldStr = asm.held.length
+        ? asm.held.map((h) => `${h.name} ×${h.qty} (${money(h.spent)})`).join(', ')
+        : 'none yet';
+      const needStr = asm.need.length ? `\nStill to buy: ${asm.need.join(', ')}.` : '';
+      const inStock = asm.spentHeld > 0 ? ` · ${money(asm.spentHeld)} spent` : '';
+      addMeta(`${asm.membersHeld}/${asm.memberCount} members held · ${asm.completeSets} set(s) ready${inStock}`,
+        `What you've bought toward this set, from Holdings. Held: ${heldStr}.${needStr}`);
+
+      // Where to buy the members you still hold none of - cheapest in-stock country, live (YATA).
+      if (asm.need.length && Object.keys(yataStock.byName).length) {
+        let inStockN = 0, cheapestTotal = 0, allPriced = true;
+        const parts = asm.need.map((nm) => {
+          const src = yataBestSource(nm);
+          if (!src) { allPriced = false; return `${nm}: no price`; }
+          cheapestTotal += src.cost;
+          if (src.qty > 0) { inStockN += 1; return `${nm}: ${src.country} ${src.qty.toLocaleString('en-US')} @ ${money(src.cost)}`; }
+          return `${nm}: none in stock (${src.country} @ ${money(src.cost)})`;
+        });
+        const sum = cheapestTotal > 0 ? ` · one each ${allPriced ? '' : '≥'}${money(cheapestTotal)}` : '';
+        addMeta(`Buy abroad — ${inStockN}/${asm.need.length} in stock${sum}`,
+          `Cheapest country per member you still need, live (YATA). ${parts.join(' · ')}`);
+      }
+
+      // The money calc only once a price is entered — otherwise it's all zeros.
+      if (pointsPrice > 0) {
+        const ge = r.missing.length ? '≥' : '';
+        const missNote = r.missing.length
+          ? `${r.missing.length} member price(s) unknown, so cost is a lower bound: ${r.missing.slice(0, 8).join(', ')}${r.missing.length > 8 ? '…' : ''}. `
+          : '';
+        addMeta(`cost ${ge}${money(r.setCost)} · ${r.payout} pts${r.payoutEst ? ' (est.)' : ''} × ${money(pointsPrice)} = ${money(r.proceeds)}`,
+          `${missNote}Cost = one of each member at abroad price (yours where held, else Torn's). ${r.payoutEst ? 'Points/set assumed 10 until a real exchange is seen.' : 'Points/set from your last exchange.'}`);
+      }
+
+      if (asm.completeSets > 0) {
+        addMeta(`→ exchange ${asm.completeSets} set(s) now for ~${asm.completeSets * r.payout} pts`,
+          'Points from exchanging every complete set you can assemble right now.');
+      }
+    }
+  }
+
+  // Per-day profit/loss breakdown so a user can compare day to day.
+  // Reads the permanent `salesData.daily` ledger (never trimmed), folds in manual
+  // cost bases the same way the headline does (display-derived, from the still-present
+  // recent rows, so recent days match the headline), and highlights the best/worst day.
+  function renderDaily() {
+    const section = $('#flipr-daily-section');
+    const listEl = $('#flipr-daily-list');
+    if (!section || !listEl) return;
+    const daily = salesData.daily || {};
+    const keys = Object.keys(daily);
+    if (!keys.length) { section.style.display = 'none'; listEl.innerHTML = ''; return; }
+
+    // Manual-basis adjustments bucketed by day (a no-basis sale given a cost basis
+    // counts its proceeds-minus-basis as that day's profit - mirrors renderProfits).
+    const adj = {};
+    for (const r of (salesData.recent || [])) {
+      if (r.matchedQty > 0) continue;
+      const c = Number(r.manualCost);
+      if (!Number.isFinite(c)) continue;
+      const dk = dayKeyOf(r.ts);
+      adj[dk] = (adj[dk] || 0) + ((Number(r.proceeds) || 0) - c);
+    }
+
+    const rows = keys.map((k) => {
+      const d = daily[k];
+      return {
+        key: k,
+        profit: (Number(d.profit) || 0) + (adj[k] || 0),
+        proceeds: Number(d.proceeds) || 0,
+        fee: Number(d.fee) || 0,
+        count: Number(d.count) || 0,
+      };
+    }).sort((a, b) => (a.key < b.key ? 1 : a.key > b.key ? -1 : 0)); // newest first
+
+    // Best/worst across ALL tracked days, not just the drawn window.
+    let best = rows[0], worst = rows[0];
+    for (const r of rows) {
+      if (r.profit > best.profit) best = r;
+      if (r.profit < worst.profit) worst = r;
+    }
+    const markable = rows.length > 1 && best.profit !== worst.profit;
+
+    section.style.display = '';
+    listEl.innerHTML = '';
+    const shown = rows.slice(0, DAILY_ROWS_SHOWN);
+    for (const r of shown) {
+      const row = document.createElement('div');
+      row.className = 'flipr-holding';
+
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'flipr-holding-name';
+      const dt = new Date(r.key + 'T00:00:00');
+      const label = isNaN(dt.getTime())
+        ? r.key
+        : dt.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+      let tag = '';
+      if (markable && r.key === best.key) tag = ' ★';
+      else if (markable && r.key === worst.key) tag = ' ⚠';
+      nameSpan.textContent = label + tag;
+
+      const metaSpan = document.createElement('span');
+      metaSpan.className = 'flipr-holding-meta';
+      metaSpan.style.color = r.profit >= 0 ? 'var(--flipr-pos, #6c6)' : 'var(--flipr-neg, #e66)';
+      metaSpan.textContent = `${r.profit >= 0 ? '+' : ''}${money(r.profit)}`;
+
+      const feeStr = r.fee > 0 ? ` · ${money(r.fee)} tax` : '';
+      const detail = `${label} · ${r.profit >= 0 ? '+' : ''}${money(r.profit)} · ${r.count} sale(s) · ${money(r.proceeds)} sold${feeStr}`;
+      nameSpan.title = detail;
+      metaSpan.title = detail;
+
+      row.appendChild(nameSpan);
+      row.appendChild(metaSpan);
+      listEl.appendChild(row);
+    }
+    if (rows.length > shown.length) {
+      const more = document.createElement('div');
+      more.className = 'flipr-holding-meta';
+      more.textContent = `+${rows.length - shown.length} earlier day(s) tracked`;
+      listEl.appendChild(more);
+    }
+  }
+
   function renderProfits() {
+    // Off-market disposals and the set-exchange tool render independently of sales
+    // history (you can hold/consume items without ever logging a sale), so these run
+    // before the no-sales return below.
+    renderDisposals();
+    renderDaily();
     const summaryEl = $('#flipr-profits-summary');
     const listEl = $('#flipr-sales-list');
     if (!summaryEl || !listEl) return;
@@ -3622,6 +4907,13 @@
 
       row.appendChild(nameSpan);
       row.appendChild(metaSpan);
+      // Delete/reverse this sale (undo via toast).
+      const delBtn = document.createElement('span');
+      delBtn.className = 'flipr-sale-del';
+      delBtn.textContent = '✕';
+      delBtn.title = 'Delete this sale (returns the items to Holdings; undo from the toast)';
+      delBtn.addEventListener('click', (e) => { e.stopPropagation(); reverseSale(rec); });
+      row.appendChild(delBtn);
       listEl.appendChild(row);
     }
   }
@@ -3636,6 +4928,7 @@
     if (tab === 'main') renderHoldings();
     else if (tab === 'profits') renderProfits();
     else if (tab === 'points') renderPointsLots();
+    else if (tab === 'sets') renderSetProfit();
     else {
       // Settings tab: nothing data-driven is on screen, but the Sell Check dropdown
       // on the Flip tab must stay in sync for when you switch back to it.
@@ -3644,6 +4937,7 @@
     refreshStatusLine();
   }
   migrateLegacyPointsLots();
+  migrateMuseumDisposalsToPoints();
   renderAll();
 
   ////////////////////////////////////////////////////////////////////////////
@@ -4849,35 +6143,41 @@ yasukuni sword|65|70|49|54
     return { name, money, items, resolved: hasMoney };
   }
 
-  // Parse "14:54:57 - 03/07/26" (DD/MM/YY) near the accepted line into unix seconds.
-  function acceptedTsSeconds(text) {
+  // The "14:54:57 - 03/07/26" (DD/MM/YY) stamp next to the accepted line, read as
+  // epoch ms. Torn may print trade times in TCT (UTC) or in your local timezone
+  // depending on your account's time setting, and the page doesn't say which, so of
+  // the two readings this returns the one CLOSER to now (for a just-completed trade
+  // that is the right one). null when no readable stamp is on the page.
+  function acceptedTimeMs(text) {
     const m = text.match(/(\d{2}):(\d{2}):(\d{2})\s*-\s*(\d{2})\/(\d{2})\/(\d{2})[\s\S]{0,60}?the trade was accepted by/i);
-    if (!m) return Math.floor(Date.now() / 1000);
-    const [, HH, MM, SS, dd, mo, yy] = m;
-    const d = new Date(2000 + Number(yy), Number(mo) - 1, Number(dd), Number(HH), Number(MM), Number(SS));
-    const t = Math.floor(d.getTime() / 1000);
-    return Number.isFinite(t) ? t : Math.floor(Date.now() / 1000);
+    if (!m) return null;
+    const HH = +m[1], MM = +m[2], SS = +m[3], dd = +m[4], mo = +m[5], y = 2000 + +m[6];
+    const now = Date.now();
+    let best = null;
+    for (const t of [new Date(y, mo - 1, dd, HH, MM, SS).getTime(), Date.UTC(y, mo - 1, dd, HH, MM, SS)]) {
+      if (Number.isFinite(t) && (best == null || Math.abs(now - t) < Math.abs(now - best))) best = t;
+    }
+    return best;
+  }
+
+  // Unix seconds the trade was accepted (now if the stamp can't be read). Previously
+  // this always read the stamp as LOCAL time, so with Torn showing TCT a sale could be
+  // booked hours off - onto the wrong day in the Daily breakdown.
+  function acceptedTsSeconds(text) {
+    const t = acceptedTimeMs(text);
+    return Math.floor((t == null ? Date.now() : t) / 1000);
   }
 
   // How long ago (seconds) the "trade was accepted" line is, versus now. A completed-
   // trade log page looks identical whether the trade just happened or you opened it
   // from Past Trades months later, so this is what tells auto-logging the two apart.
-  // Torn may print trade times in TCT (UTC) or in your local timezone depending on
-  // your account's time setting, so measure the age under BOTH readings and take the
-  // smaller: a just-completed trade is ~0s old under whichever Torn is actually using,
-  // while a genuinely old trade is far past the window under both. Unreadable
-  // timestamp -> 0 (treat as fresh; never drop a real trade over an unparsed time).
+  // Taking the closer of the two timezone readings (see acceptedTimeMs) means a just-
+  // completed trade is ~0s old, while a genuinely old trade is far past the window
+  // under both. Unreadable timestamp -> 0 (treat as fresh; never drop a real trade
+  // over an unparsed time).
   function tradeAgeSeconds(text) {
-    const m = text.match(/(\d{2}):(\d{2}):(\d{2})\s*-\s*(\d{2})\/(\d{2})\/(\d{2})[\s\S]{0,60}?the trade was accepted by/i);
-    if (!m) return 0;
-    const HH = +m[1], MM = +m[2], SS = +m[3], dd = +m[4], mo = +m[5], y = 2000 + +m[6];
-    const asLocal = new Date(y, mo - 1, dd, HH, MM, SS).getTime();
-    const asUtc = Date.UTC(y, mo - 1, dd, HH, MM, SS);
-    const now = Date.now();
-    const ageL = Number.isFinite(asLocal) ? Math.abs(now - asLocal) : Infinity;
-    const ageU = Number.isFinite(asUtc) ? Math.abs(now - asUtc) : Infinity;
-    const age = Math.min(ageL, ageU);
-    return Number.isFinite(age) ? age / 1000 : 0;
+    const t = acceptedTimeMs(text);
+    return t == null ? 0 : Math.abs(Date.now() - t) / 1000;
   }
   // Only a freshly completed trade should auto-log; older than this (under both
   // timezone readings) means you're browsing history, so record nothing.
@@ -5062,6 +6362,283 @@ yasukuni sword|65|70|49|54
     }, 700);
   }
 
+  ////////////////////////////////////////////////////////////////////////////
+  ////  TRADE PROBE  [read-only diagnostic]
+  ////////////////////////////////////////////////////////////////////////////
+  //
+  // A read-only fingerprint of the live player-trade flow, for debugging the trade
+  // recorder (the trade-decline / fires-before-acceptance bug). On each trade-page
+  // event it snapshots the visible stage headings and buttons, the key selectors
+  // (.trade-cont / .user.left / .user.right / the "accepted" line), the trade-ish
+  // container classes, a short text snippet, and a structure dump of each column.
+  // A signature de-dupe collapses React re-render churn to one entry per genuine
+  // stage change. Output goes three ways at once: a draggable overlay you can watch
+  // during a real trade (works on PDA), green [FLIPR-PROBE] console lines, and the
+  // `tradeProbeLog` ring buffer in the debug export. Strictly read-only - it only
+  // reads your own trade page and never clicks, fills, or submits anything.
+
+  const tradeProbeLog = [];
+  const TRADE_PROBE_LIMIT = 40;
+  let lastProbeSig = '';
+
+  // Clean any page text for the probe: drop non-ASCII (PDA-safe export), collapse
+  // whitespace, and cap the length so one snippet can't bloat the ring buffer.
+  function probeClean(s, cap) {
+    let t = String(s == null ? '' : s).replace(/[^\x20-\x7E]+/g, ' ').replace(/\s+/g, ' ').trim();
+    if (cap && t.length > cap) t = t.slice(0, cap) + '...';
+    return t;
+  }
+
+  // Ground-truth structure of a trade column: tag.class = ownText for each element,
+  // depth-first and node-capped. This is the one thing the stage snapshot can't infer -
+  // the exact nesting that the reader walks (where the name lives, whether item values
+  // sit inside .name) - so when the reader fix misses an edge, this dump shows the real
+  // DOM with no extra round trip. Read-only; never touches the page.
+  function probeStructDump(root, cap) {
+    const out = [];
+    const max = cap || 70;
+    const walk = (el, depth) => {
+      if (!el || out.length >= max || depth > 6) return;
+      const tag = (el.tagName || '').toLowerCase();
+      let cls = el.className;
+      if (cls && typeof cls !== 'string' && cls.baseVal != null) cls = cls.baseVal; // SVG className is an object
+      cls = probeClean(cls, 60).replace(/\s+/g, '.');
+      let own = '';
+      for (const n of el.childNodes) if (n.nodeType === 3) own += n.nodeValue;
+      own = probeClean(own, 50);
+      out.push('  '.repeat(Math.min(depth, 6)) + tag + (cls ? '.' + cls : '') + (own ? ' = ' + own : ''));
+      for (const c of el.children) walk(c, depth + 1);
+    };
+    try { walk(root, 0); } catch (e) { out.push('ERR ' + probeClean((e && e.message) || e, 60)); }
+    return out.join('\n');
+  }
+
+  // The step name as Torn carries it, from the hash or the query (either can hold it).
+  function probeStep() {
+    const q = location.hash + '&' + location.search;
+    const m = q.match(/[?&#]step=([a-z0-9_]+)/i);
+    return m ? m[1].toLowerCase() : '';
+  }
+
+  // Build a read-only fingerprint of the current trade page and, if it is a new
+  // stage, push it to the ring buffer + console and refresh the overlay.
+  function captureTradeStage(trigger) {
+    if (!settings.tradeProbe) { probeOverlayHide(); return; }
+    if (!/\/trade\.php/i.test(location.pathname)) { probeOverlayHide(); return; }
+    let snap;
+    try {
+      const cont = document.querySelector('.trade-cont');
+      const bodyText = document.body ? document.body.textContent || '' : '';
+      // Sample EVERY distinct trade-ish container class, not just .trade-cont, so a
+      // renamed or mobile live-trade container surfaces here instead of as a silent
+      // miss (the exact failure the completed-trade reader can hit).
+      const classSet = new Set();
+      Array.from(document.querySelectorAll('[class*="trade" i], [class*="Trade"]'))
+        .slice(0, 40)
+        .forEach((el) => { const c = probeClean(el.className || el.tagName, 60); if (c) classSet.add(c); });
+      // The stage wording: headings and action buttons in the trade region tell the
+      // initiate / add-items / confirm / accepted stages apart.
+      const scope = cont || document.querySelector('#mainContainer') || document.body;
+      const headings = [];
+      if (scope) {
+        Array.from(scope.querySelectorAll('h2,h3,h4,h5,.title-black,.title,button,input[type="button"],input[type="submit"],a.torn-btn'))
+          .slice(0, 30)
+          .forEach((el) => {
+            const t = probeClean(el.value || el.textContent, 40);
+            if (t && headings.indexOf(t) === -1) headings.push(t);
+          });
+      }
+      snap = {
+        t: new Date().toISOString(),
+        trigger: trigger || '',
+        href: probeClean(location.pathname + location.search + location.hash, 160),
+        step: probeStep(),
+        tradeId: currentTradeId() || '',
+        sel: {
+          tradeCont: !!cont,
+          userLeft: !!document.querySelector('.user.left'),
+          userRight: !!document.querySelector('.user.right'),
+          acceptedLine: /the trade was accepted by/i.test(bodyText)
+        },
+        classes: Array.from(classSet).slice(0, 10),
+        headings: headings.slice(0, 14),
+        snippet: probeClean(cont ? cont.textContent : (scope ? scope.textContent : ''), 500)
+      };
+      // When both columns exist, attach their exact structure so the reader can be
+      // matched to the real DOM, not guessed. These don't feed the stage signature -
+      // they ride along on whichever stage snapshot gets recorded.
+      const L = document.querySelector('.user.left');
+      const R = document.querySelector('.user.right');
+      if (L) snap.leftStruct = probeStructDump(L, 80);
+      if (R) snap.rightStruct = probeStructDump(R, 80);
+    } catch (e) {
+      snap = { t: new Date().toISOString(), trigger: trigger || '', error: probeClean((e && e.message) || e, 120) };
+    }
+    // Only a change in step / ID / selectors / stage headings is a NEW stage. A bare
+    // re-render keeps the same signature and just refreshes the overlay timestamp.
+    const sig = [snap.step, snap.tradeId, JSON.stringify(snap.sel || {}), (snap.headings || []).join('|'), snap.error || ''].join('~');
+    const isNew = sig !== lastProbeSig;
+    if (isNew) {
+      lastProbeSig = sig;
+      tradeProbeLog.push(snap);
+      if (tradeProbeLog.length > TRADE_PROBE_LIMIT) tradeProbeLog.splice(0, tradeProbeLog.length - TRADE_PROBE_LIMIT);
+      try {
+        const s = snap.sel || {};
+        console.log('%c[FLIPR-PROBE] ' + (snap.step || '(no step)') + (snap.tradeId ? ' #' + snap.tradeId : '') +
+          ' | cont:' + !!s.tradeCont + ' L:' + !!s.userLeft + ' R:' + !!s.userRight + ' accepted:' + !!s.acceptedLine +
+          (snap.headings && snap.headings.length ? ' | ' + snap.headings.join(' / ') : ''),
+          'color:#19c37d;font-weight:bold', snap);
+      } catch (e) { /* console may be unavailable in the sandbox */ }
+    }
+    probeOverlayRender(snap, isNew);
+  }
+
+  // The observer/hashchange that drives scanTradeLog also drives the probe - one
+  // extra call, no new observer. The signature de-dupe keeps the flood of trade.php
+  // mutations down to one entry per genuine stage change.
+  function tradeProbeTick(trigger) {
+    if (!settings.tradeProbe) return;
+    try { captureTradeStage(trigger); } catch (e) { /* diagnostics must never break the page */ }
+  }
+
+  // rAF-coalesced tick for the mutation flood; hashchange/popstate/init call
+  // tradeProbeTick directly. Keeps the probe light under trade.php re-renders.
+  let probeTickQueued = false;
+  function tradeProbeTickRAF(trigger) {
+    if (!settings.tradeProbe) return;
+    if (probeTickQueued) return;
+    probeTickQueued = true;
+    const run = () => { probeTickQueued = false; tradeProbeTick(trigger); };
+    try { requestAnimationFrame(run); } catch (e) { setTimeout(run, 60); }
+  }
+
+  // ---- Probe overlay -----------------------------------------------------------
+  // A small, isolated, draggable readout so a PDA user (no console) can watch the
+  // stages change during a live trade and Copy the full log out. Its own id/inline
+  // styles - it borrows nothing from the main panel's design system.
+  let probeOverlayEl = null;
+  function probeFallbackCopy(text, done) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0'; ta.style.left = '-9999px';
+      document.body.appendChild(ta); ta.focus(); ta.select();
+      document.execCommand('copy'); document.body.removeChild(ta);
+      if (done) done();
+    } catch (e) { try { showToast('FLIPR: copy failed - use Copy debug export instead'); } catch (e2) {} }
+  }
+  function probeEsc(s) {
+    return String(s == null ? '' : s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  }
+  function probeOverlayEnsure() {
+    if (probeOverlayEl && document.body && document.body.contains(probeOverlayEl)) return probeOverlayEl;
+    if (!document.body) return null;
+    const el = document.createElement('div');
+    el.id = 'flipr-trade-probe-overlay';
+    el.style.cssText = [
+      'position:fixed', 'right:8px', 'bottom:8px', 'z-index:2147483646',
+      'width:300px', 'max-width:92vw', 'max-height:62vh', 'overflow:auto',
+      'background:#14171c', 'color:#d8dde4', 'border:1px solid #2a2f37',
+      'border-radius:10px', 'box-shadow:0 6px 24px rgba(0,0,0,.45)',
+      'font:11px/1.45 ui-monospace,Menlo,Consolas,monospace', 'padding:8px 9px'
+    ].join(';');
+    const btnCss = 'font:11px monospace;cursor:pointer;background:#232a33;color:#d8dde4;border:1px solid #39414c;border-radius:5px;padding:1px 7px';
+    el.innerHTML =
+      '<div id="flipr-tp-head" style="display:flex;align-items:center;justify-content:space-between;cursor:move;margin:-2px 0 6px;gap:6px">' +
+        '<strong style="color:#19c37d">FLIPR trade probe</strong>' +
+        '<span style="white-space:nowrap"><button id="flipr-tp-copy" style="' + btnCss + ';margin-right:4px">Copy</button>' +
+        '<button id="flipr-tp-hide" style="' + btnCss + '">Hide</button></span>' +
+      '</div><div id="flipr-tp-body"></div>';
+    document.body.appendChild(el);
+    probeOverlayEl = el;
+    // Drag by the header (mouse + touch, so it works on the PDA).
+    (function () {
+      const head = el.querySelector('#flipr-tp-head');
+      let sx = 0, sy = 0, ox = 0, oy = 0, dragging = false;
+      const pt = (e) => (e.touches && e.touches[0]) ? e.touches[0] : e;
+      const down = (e) => {
+        if (e.target && (e.target.id === 'flipr-tp-copy' || e.target.id === 'flipr-tp-hide')) return;
+        const r = el.getBoundingClientRect();
+        ox = r.left; oy = r.top; sx = pt(e).clientX; sy = pt(e).clientY; dragging = true;
+        el.style.right = 'auto'; el.style.bottom = 'auto'; el.style.left = ox + 'px'; el.style.top = oy + 'px';
+        if (e.cancelable) e.preventDefault();
+      };
+      const move = (e) => {
+        if (!dragging) return;
+        el.style.left = (ox + pt(e).clientX - sx) + 'px';
+        el.style.top = (oy + pt(e).clientY - sy) + 'px';
+        if (e.cancelable) e.preventDefault();
+      };
+      const up = () => { dragging = false; };
+      head.addEventListener('mousedown', down);
+      head.addEventListener('touchstart', down, { passive: false });
+      window.addEventListener('mousemove', move);
+      window.addEventListener('touchmove', move, { passive: false });
+      window.addEventListener('mouseup', up);
+      window.addEventListener('touchend', up);
+    })();
+    el.querySelector('#flipr-tp-hide').addEventListener('click', () => {
+      settings.tradeProbe = false;
+      saveSettings(settings);
+      try { syncSettingsControls(); } catch (e) {}
+      probeOverlayHide();
+    });
+    el.querySelector('#flipr-tp-copy').addEventListener('click', () => {
+      const text = JSON.stringify(tradeProbeLog, null, 2);
+      const done = () => { try { showToast('FLIPR: trade probe log copied (' + tradeProbeLog.length + ' stages)'); } catch (e) {} };
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, () => probeFallbackCopy(text, done));
+        else probeFallbackCopy(text, done);
+      } catch (e) { probeFallbackCopy(text, done); }
+    });
+    return el;
+  }
+  function probeOverlayHide() {
+    if (probeOverlayEl && probeOverlayEl.parentNode) probeOverlayEl.parentNode.removeChild(probeOverlayEl);
+    probeOverlayEl = null;
+  }
+  function probeOverlayRender(snap, isNew) {
+    if (!settings.tradeProbe) { probeOverlayHide(); return; }
+    const el = probeOverlayEnsure();
+    if (!el) return;
+    const bodyEl = el.querySelector('#flipr-tp-body');
+    if (!bodyEl) return;
+    const yn = (b) => b ? '<span style="color:#19c37d">yes</span>' : '<span style="color:#e0674f">no</span>';
+    const s = (snap && snap.sel) || {};
+    const rows = [];
+    rows.push('<div><b>step</b> ' + probeEsc(snap.step || '(none)') + (snap.tradeId ? ' &nbsp; <b>ID</b> ' + probeEsc(snap.tradeId) : '') + '</div>');
+    rows.push('<div><b>.trade-cont</b> ' + yn(s.tradeCont) + ' &nbsp; <b>.user.left</b> ' + yn(s.userLeft) + ' &nbsp; <b>.user.right</b> ' + yn(s.userRight) + '</div>');
+    rows.push('<div><b>accepted line</b> ' + yn(s.acceptedLine) + '</div>');
+    if (snap.classes && snap.classes.length) rows.push('<div style="margin-top:4px;opacity:.85"><b>trade classes:</b> ' + probeEsc(snap.classes.join(', ')) + '</div>');
+    if (snap.headings && snap.headings.length) rows.push('<div style="margin-top:4px;opacity:.85"><b>stage text:</b> ' + probeEsc(snap.headings.join(' | ')) + '</div>');
+    if (snap.error) rows.push('<div style="color:#e0674f;margin-top:4px">error: ' + probeEsc(snap.error) + '</div>');
+    const when = probeEsc((snap.t || '').replace('T', ' ').replace(/\..*/, ''));
+    rows.push('<div style="margin-top:6px;opacity:.6">stages captured: ' + tradeProbeLog.length + ' / ' + TRADE_PROBE_LIMIT + ' &middot; ' + when + (isNew ? ' (new)' : '') + '</div>');
+    bodyEl.innerHTML = rows.join('');
+  }
+
+  // Console convenience (desktop): fliprTradeProbe() toggles the probe and prints
+  // the captured lifecycle as a table; fliprTradeProbe(true|false) forces it. PDA
+  // users use the "Probe the live trade flow" checkbox under Player trades instead.
+  try {
+    window.fliprTradeProbe = function (on) {
+      settings.tradeProbe = (typeof on === 'boolean') ? on : !settings.tradeProbe;
+      saveSettings(settings);
+      try { syncSettingsControls(); } catch (e) {}
+      if (settings.tradeProbe) { lastProbeSig = ''; tradeProbeTick('manual'); } else probeOverlayHide();
+      try {
+        console.log('%c[FLIPR-PROBE] ' + (settings.tradeProbe ? 'ON' : 'OFF') + ' - ' + tradeProbeLog.length + ' stage(s) captured',
+          'color:#19c37d;font-weight:bold');
+        if (tradeProbeLog.length) console.table(tradeProbeLog.map((r) => ({
+          step: r.step, id: r.tradeId,
+          cont: !!(r.sel && r.sel.tradeCont), L: !!(r.sel && r.sel.userLeft), R: !!(r.sel && r.sel.userRight),
+          accepted: !!(r.sel && r.sel.acceptedLine), text: (r.headings || []).join(' | ')
+        })));
+      } catch (e) { /* console.table may be absent */ }
+      return '[FLIPR] trade probe ' + (settings.tradeProbe ? 'ON' : 'OFF') + '; copy window.__fliprProbeLog for the full log';
+    };
+    Object.defineProperty(window, '__fliprProbeLog', { get: () => tradeProbeLog, configurable: true });
+  } catch (e) { /* window not writable in the sandbox - the checkbox still works */ }
+
   // Persistent trade-log watcher. This used to attach a body-scoped subtree
   // MutationObserver (plus hashchange/popstate/pushState hooks) on EVERY Torn
   // page, firing scanTradeLog() on every DOM mutation site-wide - the single
@@ -5074,20 +6651,21 @@ yasukuni sword|65|70|49|54
   // arms. The short bounded trade poll (startTradePoll, trade.php-gated) remains
   // the safety net for in-sandbox nav events that can miss (the v2.41.0 reason).
   if (/\/trade\.php/i.test(location.pathname)) {
-    window.addEventListener('hashchange', () => scanTradeLog());
-    window.addEventListener('popstate', () => scanTradeLog());
+    window.addEventListener('hashchange', () => { scanTradeLog(); tradeProbeTick('hashchange'); });
+    window.addEventListener('popstate', () => { scanTradeLog(); tradeProbeTick('popstate'); });
     try {
-      new MutationObserver(() => scanTradeLog())
+      new MutationObserver(() => { scanTradeLog(); tradeProbeTickRAF('mutation'); })
         .observe(document.body || document.documentElement, { childList: true, subtree: true });
     } catch (e) {
       log('trade observer attach failed', e);
     }
     try {
-      const wrapHist = (orig) => function () { const r = orig.apply(this, arguments); try { scanTradeLog(); } catch (e) { /* ignore */ } return r; };
+      const wrapHist = (orig) => function () { const r = orig.apply(this, arguments); try { scanTradeLog(); } catch (e) { /* ignore */ } try { tradeProbeTick('pushstate'); } catch (e) { /* ignore */ } return r; };
       history.pushState = wrapHist(history.pushState);
       history.replaceState = wrapHist(history.replaceState);
     } catch (e) { /* history not writable - hashchange + observer still cover most cases */ }
     scanTradeLog();
+    tradeProbeTick('init'); // draw the probe for whatever trade stage is already on screen
   }
 
   ////////////////////////////////////////////////////////////////////////////
@@ -5510,17 +7088,29 @@ yasukuni sword|65|70|49|54
   }
 
   async function ensureItemCatalog(apiKey) {
-    if (Date.now() - itemCatalog.fetchedAt < ITEM_CATALOG_MAX_AGE_MS && Object.keys(itemCatalog.names).length) {
+    // Also refetch when meta is empty (a catalog cached before the meta field existed),
+    // so the Set-exchange-value tool gets item types + abroad buy prices without waiting
+    // out the 24h age window.
+    if (Date.now() - itemCatalog.fetchedAt < ITEM_CATALOG_MAX_AGE_MS
+        && Object.keys(itemCatalog.names).length
+        && Object.keys(itemCatalog.meta || {}).length) {
       return itemCatalog;
     }
     const data = await tornApiFetch(`https://api.torn.com/torn/?selections=items&key=${apiKey}`);
     const names = {};
+    const meta = {};
+    // Record an item's type and foreign-shop buy price. buy_price is the base vendor
+    // (abroad) price for collectibles like plushies/flowers - exactly the "bought abroad"
+    // basis the Set-exchange tool falls back to. 0 means Torn lists no buy price.
+    const addMeta = (id, it) => {
+      meta[id] = { type: typeof it.type === 'string' ? it.type : '', buy: Number(it.buy_price) || 0 };
+    };
     if (data.items && typeof data.items === 'object') {
       if (Array.isArray(data.items)) {
-        for (const it of data.items) if (it && it.id != null) names[it.id] = it.name;
+        for (const it of data.items) if (it && it.id != null) { names[it.id] = it.name; addMeta(it.id, it); }
       } else {
         for (const [id, it] of Object.entries(data.items)) {
-          if (it && typeof it.name === 'string') names[id] = it.name;
+          if (it && typeof it.name === 'string') { names[id] = it.name; addMeta(id, it); }
         }
       }
     }
@@ -5528,7 +7118,7 @@ yasukuni sword|65|70|49|54
       log('item catalog fetch returned no usable names', data);
       return itemCatalog; // keep whatever we had, don't overwrite with an empty map
     }
-    itemCatalog = { fetchedAt: Date.now(), names };
+    itemCatalog = { fetchedAt: Date.now(), names, meta };
     saveItemCatalog(itemCatalog);
     return itemCatalog;
   }
@@ -5575,6 +7165,42 @@ yasukuni sword|65|70|49|54
   // guessed at - see buildDebugExport() below.
   let lastPollDebug = { at: null, since: null, fetchedCount: null, matchedCount: 0, skipped: [], error: null };
 
+  // Log-shape capture. The API user log carries Museum exchanges
+  // (plushies/flowers -> points) and player trades ("Trade completed" / "Trade
+  // money outgoing" / "Trade items incoming"), but FLIPR skips them (they are
+  // neither a purchase nor a market-sale type id). To build auto-detection -
+  // move a museum exchange's items into the disposals ledger with the points
+  // gained, and record a completed trade - we need the exact log TYPE ID and the
+  // raw `data` object of one real entry of each kind (Torn does not publish a
+  // schema for `data`; it must be read off a live entry). This grabs ONE full
+  // example per distinct type id into the debug export. Capture-only, read-only,
+  // test-build-only: it changes nothing about what the poll records.
+  const LOG_SHAPE_SAMPLE_LIMIT = 24;
+  const logShapeSamples = [];
+  function captureLogShape(entry, details, category, title, typeId) {
+    try {
+      const isTrade = category === 'trades' || /trade/.test(title);
+      const isMuseum = category === 'museum' || /museum/.test(title);
+      if (!isTrade && !isMuseum) return;
+      // These entries are never marked processed, so the rolling lookback re-sees
+      // them every poll - dedup by type id (title as a fallback) so the sample
+      // cannot grow unbounded; just count repeats.
+      const key = Number.isFinite(typeId) ? 't' + typeId : 'x' + String(title || 'unknown');
+      const existing = logShapeSamples.find((s) => s._key === key);
+      if (existing) { existing.seen++; return; }
+      if (logShapeSamples.length >= LOG_SHAPE_SAMPLE_LIMIT) return;
+      logShapeSamples.push({
+        _key: key,
+        logTypeId: Number.isFinite(typeId) ? typeId : null,
+        title: details.title,
+        category: details.category,
+        seen: 1,
+        // The complete entry exactly as Torn returned it - data/params/log/id/timestamp.
+        raw: entry,
+      });
+    } catch (e) { /* diagnostics must never break the poll */ }
+  }
+
   function processLogEntries(entries) {
     let maxTimestamp = logState.lastTimestamp;
     let matchedCount = 0;
@@ -5598,6 +7224,10 @@ yasukuni sword|65|70|49|54
       const category = String(details.category || '').toLowerCase();
       const title = String(details.title || '').toLowerCase();
       const typeId = Number(details.id);
+      // Grab a full example of Museum/Trade entries (which skip below)
+      // so their type id + data shape can be read from the debug export. No-op for
+      // everything else; never alters routing.
+      captureLogShape(entry, details, category, title, typeId);
       // A city-shop (4200) or abroad (4201) buy, recognized by type id. These
       // bypass the category/title purchase gate below so an abroad buy whose
       // category string is not 'shops' is still captured, not skipped.
@@ -5622,6 +7252,19 @@ yasukuni sword|65|70|49|54
           Diag.bump('saleEntryDropped');
           if (skipped.length < 20) skipped.push({ title: details.title, category: details.category, rawData: entry.data });
         }
+        continue;
+      }
+
+      // Museum exchange (type 7000): move the consumed plushies/flowers/
+      // artifact out of Holdings into the disposals ledger, points pre-filled. Claim the
+      // id first (same rule as sales/buys) so no re-poll or other open tab can ever
+      // double-apply it. Guarded so a parse slip can never break the poll. See
+      // processMuseumExchange / museumSetMatcher.
+      if (typeId === MUSEUM_EXCHANGE_LOG_TYPE_ID) {
+        Diag.bump('museumSeen');
+        if (hasEntryId) markLogIdProcessed(entryId);
+        const museumRec = Diag.guard('processMuseumExchange', () => processMuseumExchange(entry));
+        if (museumRec) matchedCount++;
         continue;
       }
 
@@ -5808,12 +7451,16 @@ yasukuni sword|65|70|49|54
     // scan on every refresh" request. Capture is the instant on-page detection
     // (if on, it catches a buy as it happens) plus the "Scan now" button, which
     // runs pollLog() on demand. Desktop (manualScan off) is unchanged.
-    if (settings.manualScan) return;
+    if (settings.manualScan || logPollTimerStarted) return;
+    logPollTimerStarted = true;
     setTimeout(() => {
       pollLog();
-      setInterval(pollLog, LOG_POLL_INTERVAL_MS);
+      // each tick re-checks manualScan, so switching it on stops the
+      // auto-poll without a reload (the interval stays, idle).
+      setInterval(() => { if (!settings.manualScan) pollLog(); }, LOG_POLL_INTERVAL_MS);
     }, POLL_START_DELAY_MS);
   }
+  var logPollTimerStarted = false;
 
   ////////////////////////////////////////////////////////////////////////////
   ////  AUTO-DETECT: sell/listing price field
@@ -6070,10 +7717,6 @@ yasukuni sword|65|70|49|54
 
   const mqCache = [];            // ephemeral Item Market listings (see section header)
   let mqProcessed = new WeakMap(); // tile -> last drawn signature, so a redraw is a no-op
-  let mqBazaarObserver = null;
-  let mqItemMarketObserver = null;
-  let mqInventoryObserver = null;
-  let mqDisplayCaseObserver = null;
   let mqStarted = false;
   let mqRaf = 0;
 
@@ -6181,6 +7824,19 @@ yasukuni sword|65|70|49|54
     else titleEl.appendChild(box);
   }
 
+  // Torn's bonus tooltips are HTML inside an attribute ("<b>Quicken</b><br>..."). Parse
+  // them in an INERT document: a detached <div> in the live page still fetches any
+  // <img> in the markup and fires its handlers; a DOMParser document never runs or
+  // loads anything. Returns that document's <body> (query it like the old <div>).
+  function parseTitleHtml(html) {
+    return new DOMParser().parseFromString(String(html || ''), 'text/html').body;
+  }
+  // Fallback bonus name from the icon's class: "bonus-attachment-sure-shot" -> "Sure Shot".
+  function bonusNameFromClass(cls) {
+    const nm = String(cls || '').match(/bonus-attachment-([a-z0-9-]+)/i);
+    return nm && nm[1] ? nm[1].replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()) : '';
+  }
+
   // Bazaar bonus icons carry the name/description in data attributes; the title can
   // be a little HTML (<b>Name</b>...). Stat icons (damage/accuracy/armour) live in a
   // different group but are excluded here defensively.
@@ -6193,8 +7849,7 @@ yasukuni sword|65|70|49|54
       const rawTitle = icon.getAttribute('data-bonus-attachment-title') || '';
       const rawDesc = icon.getAttribute('data-bonus-attachment-description') || '';
       if (!rawTitle && !rawDesc) continue;
-      const tmp = document.createElement('div');
-      tmp.innerHTML = rawTitle;
+      const tmp = parseTitleHtml(rawTitle);
       const bold = tmp.querySelector('b');
       const name = ((bold ? bold.textContent : tmp.textContent) || '').trim();
       if (!name) continue;
@@ -6259,15 +7914,6 @@ yasukuni sword|65|70|49|54
       mqInjectBonuses(titleEl, bonuses, stockEl);
       mqProcessed.set(tile, sig);
     }
-  }
-
-  function mqInitBazaar() {
-    mqWaitFor('#bazaarRoot', (root) => {
-      mqSchedule();
-      const obs = new MutationObserver(() => mqSchedule());
-      obs.observe(root, { childList: true, subtree: true });
-      mqBazaarObserver = obs;
-    });
   }
 
   // ---- Item Market (fetch cache + tile matching) --------------------------
@@ -6463,16 +8109,6 @@ yasukuni sword|65|70|49|54
     };
   }
 
-  function mqInitItemMarket() {
-    mqInstallFetchHook();
-    mqWaitFor('#item-market-root', (root) => {
-      mqSchedule();
-      const obs = new MutationObserver(() => mqSchedule());
-      obs.observe(root, { childList: true, subtree: true });
-      mqItemMarketObserver = obs;
-    });
-  }
-
   // ---- Items page / inventory (pure DOM) ----------------------------------
   // item.php lists each owned weapon/armour as an <li data-item="ID"> whose
   // damage/accuracy (or armour) sit in an inline .bonuses-wrap - the SAME
@@ -6496,14 +8132,10 @@ yasukuni sword|65|70|49|54
     const decode = (html) => { const ta = document.createElement('textarea'); ta.innerHTML = html || ''; return ta.value; };
     for (const icon of wrap.querySelectorAll('i[data-bonusid]')) {
       if (!icon.getAttribute('data-bonusid')) continue; // empty slot
-      const holder = document.createElement('div');
-      holder.innerHTML = decode(icon.getAttribute('title') || '');
+      const holder = parseTitleHtml(decode(icon.getAttribute('title') || ''));
       const bold = holder.querySelector('b');
       let name = ((bold ? bold.textContent : '') || '').trim();
-      if (!name) {
-        const nm = (icon.getAttribute('class') || '').match(/bonus-attachment-([a-z0-9-]+)/i);
-        if (nm && nm[1]) name = nm[1].replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
-      }
+      if (!name) name = bonusNameFromClass(icon.getAttribute('class'));
       if (!name) continue;
       const desc = (holder.textContent || '').replace(name, '').trim();
       const pm = desc.match(/(\d+(?:\.\d+)?)\s*%/);
@@ -6561,14 +8193,10 @@ yasukuni sword|65|70|49|54
       if (/bonus-attachment-item-(damage|accuracy|armou?r|defen[cs]e)-bonus/i.test(cls)) continue; // stat -> quality, not a bonus
       if (/bonus-attachment-blank/i.test(cls)) continue; // empty slot
       const rawTitle = span.getAttribute('title') || (icon && icon.getAttribute('title')) || '';
-      const holder = document.createElement('div');
-      holder.innerHTML = rawTitle; // display-case titles are real HTML (<b>Name</b><br>...)
+      const holder = parseTitleHtml(rawTitle); // display-case titles are real HTML (<b>Name</b><br>...)
       const bold = holder.querySelector('b');
       let name = ((bold ? bold.textContent : '') || '').trim();
-      if (!name) {
-        const nm = cls.match(/bonus-attachment-([a-z0-9-]+)/i);
-        if (nm && nm[1]) name = nm[1].replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
-      }
+      if (!name) name = bonusNameFromClass(cls);
       if (!name) continue;
       const desc = (holder.textContent || '').replace(name, '').trim();
       const pm = desc.match(/(\d+(?:\.\d+)?)\s*%/);
@@ -6633,14 +8261,10 @@ yasukuni sword|65|70|49|54
       const cls = icon.getAttribute('class') || '';
       if (/bonus-attachment-item-(damage|accuracy|armou?r|defen[cs]e)-bonus/i.test(cls)) continue; // stat -> quality, not a bonus
       if (/bonus-attachment-blank/i.test(cls)) continue; // empty slot
-      const holder = document.createElement('div');
-      holder.innerHTML = icon.getAttribute('title') || ''; // armoury titles are real HTML (<b>Quicken</b><br>...)
+      const holder = parseTitleHtml(icon.getAttribute('title')); // armoury titles are real HTML (<b>Quicken</b><br>...)
       const bold = holder.querySelector('b');
       let name = ((bold ? bold.textContent : '') || '').trim();
-      if (!name) {
-        const nm = cls.match(/bonus-attachment-([a-z0-9-]+)/i);
-        if (nm && nm[1]) name = nm[1].replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
-      }
+      if (!name) name = bonusNameFromClass(cls);
       if (!name) continue;
       const desc = (holder.textContent || '').replace(name, '').trim();
       const pm = desc.match(/(\d+(?:\.\d+)?)\s*%/);
@@ -6686,14 +8310,9 @@ yasukuni sword|65|70|49|54
   }
 
   // ---- shared lifecycle ---------------------------------------------------
-  function mqWaitFor(sel, cb, tries) {
-    tries = tries == null ? 40 : tries;
-    const el = document.querySelector(sel);
-    if (el) { cb(el); return; }
-    if (tries <= 0) return;
-    setTimeout(() => mqWaitFor(sel, cb, tries - 1), 300);
-  }
-
+  // (The old per-page mqInitBazaar / mqInitItemMarket / mqWaitFor bootstrap and its
+  // write-only observer vars were removed in 2.48.19-test - nothing called them since
+  // mqStart below replaced them with one page-agnostic observer.)
   function mqProcessCurrent() {
     if (!settings.marketQuality) return;
     if (!isItemMarketPage()) mqRemoveFilterBar(); // filter UI is Item Market only
@@ -6733,9 +8352,8 @@ yasukuni sword|65|70|49|54
     if (mqStarted) return;
     mqStarted = true;
     try { mqInstallFetchHook(); } catch (e) { /* only the Item Market cache fallback needs it */ }
-    const obs = new MutationObserver(() => mqSchedule());
-    obs.observe(document.body || document.documentElement, { childList: true, subtree: true });
-    mqInventoryObserver = obs;
+    new MutationObserver(() => mqSchedule())
+      .observe(document.body || document.documentElement, { childList: true, subtree: true });
     window.addEventListener('hashchange', mqSchedule);
     window.addEventListener('popstate', mqSchedule);
     try {
